@@ -24,6 +24,7 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(${PROJECT_NAME} Vulkan::Vulkan)
 include(GNUInstallDirs)
 
+message(STATUS "Windows SDK version: ${CMAKE_SYSTEM_VERSION}")
 
 # Install headers
 install(
