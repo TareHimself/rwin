@@ -34,7 +34,6 @@ class RWin(ConanFile):
     def build(self):
         cmake = CMake(self)
         cmake.configure(variables={
-            "CMAKE_CXX_STANDARD" : "20",
             "RWIN_VERSION" : self.version
             })
         cmake.build()

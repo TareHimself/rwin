@@ -44,7 +44,7 @@ jobs:
       - name: Install Conan
         uses: conan-io/setup-conan@v1
 
-      - name: Verify installations
+      - name: Build project
         run: |
           task setup
           task build
