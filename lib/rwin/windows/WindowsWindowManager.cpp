@@ -742,7 +742,7 @@ namespace rwin
             SetFocus(hwnd);
         }
         {
-            DWM_WINDOW_CORNER_PREFERENCE pref = DWMWCP_ROUND;
+            auto pref = DWMWCP_ROUND;
             DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
         }
 
