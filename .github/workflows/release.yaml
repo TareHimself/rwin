@@ -45,6 +45,13 @@ jobs:
       - name: Install Conan
         uses: conan-io/setup-conan@v1
 
+      - name: Configure Conan profile
+        run: |
+          conan profile new default --detect --force
+          conan profile update settings.compiler="msvc" default
+          conan profile update settings.compiler.version=193 default
+          conan profile update settings.compiler.runtime="dynamic" default
+
       - name: Build project
         run: |
           task setup
