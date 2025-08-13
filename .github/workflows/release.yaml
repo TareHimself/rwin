@@ -1,0 +1,50 @@
+name: Build (Windows)
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches:
+  #     - releases
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Prepare Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+            vulkan-query-version: 1.4.313.2
+            vulkan-components: Vulkan-Headers, Vulkan-Loader
+            vulkan-use-cache: true
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "3.31.8"
+          ninjaVersion: "^1.11.1"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+            version: 3.x
+            repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify installations
+        run: |
+          cmake --version
+          python --version
+          task --version
+          echo "Vulkan SDK is at $env:VULKAN_SDK"
+        shell: powershell
