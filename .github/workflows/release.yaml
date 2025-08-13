@@ -41,10 +41,10 @@ jobs:
             version: 3.x
             repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install Conan
+        uses: conan-io/setup-conan@v1
+
       - name: Verify installations
         run: |
-          cmake --version
-          python --version
-          task --version
-          echo "Vulkan SDK is at $env:VULKAN_SDK"
-        shell: powershell
+          task setup
+          task build
