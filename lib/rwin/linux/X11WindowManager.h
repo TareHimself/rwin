@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include "rwin/macros.h"
-#if RWIN_PLATFORM_LINUX && RWIN_PLATFORM_LINUX_X11
+
+#if defined(RWIN_PLATFORM_LINUX) && defined(RWIN_PLATFORM_LINUX_X11)
 #include "rwin/IWindowManager.h"
 
 namespace rwin

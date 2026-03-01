@@ -24,7 +24,69 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(${PROJECT_NAME} Vulkan::Vulkan)
 include(GNUInstallDirs)
 
-message(STATUS "Windows SDK version: ${CMAKE_SYSTEM_VERSION}")
+if(LINUX)
+    find_package(wayland COMPONENTS wayland-client REQUIRED)
+    find_package(wayland-protocols REQUIRED)
+    find_package(xkbcommon REQUIRED)
+    find_package(libdecor REQUIRED)
+    include(FindPkgConfig)
+    pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+    find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner)
+
+    set(PROTOCOLS
+            stable/xdg-shell/xdg-shell.xml
+            unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+            #    unstable/relative-pointer/relative-pointer-unstable-v1.xml
+            #    unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+            #    stable/viewporter/viewporter.xml
+    )
+
+    set(WAYLAND_GENERATED_HEADERS "")
+    set(WAYLAND_GENERATED_SOURCES "")
+    set(WAYLAND_GENERATED_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/external/wayland")
+    file(MAKE_DIRECTORY ${WAYLAND_GENERATED_OUTPUT_DIR})
+    foreach(xml IN LISTS PROTOCOLS)
+        get_filename_component(name "${xml}" NAME_WE)
+        string(REPLACE "-" "_" cname ${name})  # safer variable names
+        set(header "${WAYLAND_GENERATED_OUTPUT_DIR}/${name}-client-protocol.h")
+        set(source "${WAYLAND_GENERATED_OUTPUT_DIR}/${name}-protocol.c")
+
+        list(APPEND WAYLAND_GENERATED_HEADERS ${header})
+        list(APPEND WAYLAND_GENERATED_SOURCES ${source})
+
+        if(NOT EXISTS "${header}")
+            message(STATUS "Generating ${name}")
+            execute_process(COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${WAYLAND_PROTOCOLS_DIR}/${xml} ${header})
+            if(NOT EXISTS "${header}")
+                message(FATAL_ERROR "Failed to generate ${name}")
+            endif()
+        endif()
+
+        if(NOT EXISTS "${source}")
+            message(STATUS "Generating ${name}")
+            execute_process(COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${WAYLAND_PROTOCOLS_DIR}/${xml} ${source})
+            if(NOT EXISTS "${source}")
+                message(FATAL_ERROR "Failed to generate ${name}")
+            endif()
+        endif()
+
+        message(STATUS "Generated wayland protocol: ${name}")
+    endforeach()
+
+    target_sources(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_SOURCES})
+    target_include_directories(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_OUTPUT_DIR})
+    target_link_libraries(${PROJECT_NAME} wayland::wayland-client wayland-protocols::wayland-protocols libdecor::libdecor xkbcommon::xkbcommon)
+#    set(LIBDECOR_RESOURCES $<IF:$<CONFIG:Debug>,${libdecor_RES_DIRS_DEBUG},${libdecor_RES_DIRS_RELEASE}>)
+    set(LIBDECOR_RESOURCES $<IF:$<CONFIG:Debug>,"A","B">)
+    set_property(TARGET rwin PROPERTY RESOURCE_DIRS
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/share/libdecor/plugins-1>$<BUILD_INTERFACE:$<IF:$<CONFIG:Debug>,${libdecor_RES_DIRS_DEBUG},${libdecor_RES_DIRS_RELEASE}>>
+    )
+    install(
+        DIRECTORY LIBDECOR_RESOURCES
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/share/libdecor
+    )
+
+endif()
 
 # Install headers
 install(

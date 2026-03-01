@@ -13,6 +13,7 @@
 
     #ifdef __linux__
     #define RWIN_PLATFORM_LINUX
+    #define RWIN_PLATFORM_LINUX_WAYLAND
     #endif
 
     #ifdef _WIN32

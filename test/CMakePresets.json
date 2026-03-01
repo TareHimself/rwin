@@ -4,6 +4,6 @@
         "conan": {}
     },
     "include": [
-        "..\\CMakeUserPresets.json"
+        "..\/CMakeUserPresets.json"
     ]
 }

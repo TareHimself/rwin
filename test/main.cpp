@@ -83,9 +83,13 @@ void createSwapchain(const std::uint64_t& windowId, WindowVulkanInfo& info)
 
 void drawWindow(const std::uint64_t& windowId)
 {
+    auto clientExtent = getWindowClientSize(windowId);
     auto& info = windows[windowId];
     auto size = info.extent;
-    auto targetSize = physicalDevice.getSurfaceCapabilitiesKHR(info.surface).currentExtent;
+    auto caps = physicalDevice.getSurfaceCapabilitiesKHR(info.surface);
+    vk::Extent2D targetSize{};
+    targetSize.width = clientExtent.width;
+    targetSize.height = clientExtent.height;
     if (size != targetSize)
     {
         destroySwapchain(windowId, info);
