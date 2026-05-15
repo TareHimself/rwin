@@ -1,5 +1,5 @@
 ﻿#pragma once
-#include "rwin/macros.h"
+#include "../macros_private.h"
 
 #if defined(RWIN_PLATFORM_LINUX) && defined(RWIN_PLATFORM_LINUX_X11)
 #include "rwin/IWindowManager.h"

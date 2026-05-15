@@ -1,4 +1,4 @@
-﻿#include "rwin/macros.h"
+﻿#include "../macros_private.h"
 #if defined(RWIN_PLATFORM_LINUX) && defined(RWIN_PLATFORM_LINUX_WAYLAND)
 #include "WaylandWindowManager.h"
 

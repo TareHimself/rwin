@@ -6,10 +6,19 @@ project(rwin-test LANGUAGES C CXX VERSION 1.0.0 DESCRIPTION "C++ library for man
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/_lib)
 
 # Now link against the library target (e.g., MyLib)
-add_executable(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/main.cpp)
+if(APPLE)
+    add_executable(${PROJECT_NAME}  MACOSX_BUNDLE  ${CMAKE_CURRENT_LIST_DIR}/main.cpp)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+            MACOSX_BUNDLE_BUNDLE_IDENTIFIER "com.example.${PROJECT_NAME}"
+            MACOSX_BUNDLE_BUNDLE_NAME "${PROJECT_NAME}"
+            MACOSX_BUNDLE_GUI_IDENTIFIER "com.example.${PROJECT_NAME}"
+    )
+else()
+    add_executable(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/main.cpp)
+endif()
 find_package(Vulkan REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE rwin::rwin Vulkan::Vulkan)
-if(UNIX) # or if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(LINUX) # or if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     get_target_property(RWIN_RES_DIRS rwin RESOURCE_DIRS)
     message(STATUS ${RWIN_RES_DIRS})
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD

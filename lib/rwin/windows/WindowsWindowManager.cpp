@@ -1,4 +1,4 @@
-﻿#include "rwin/macros.h"
+﻿#include "../macros_private.h"
 
 #ifdef RWIN_PLATFORM_WIN
 #ifndef _WIN32_WINNT

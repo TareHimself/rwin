@@ -1,5 +1,5 @@
 ﻿#pragma once
-#include "rwin/macros.h"
+#include "../macros_private.h"
 
 #ifdef RWIN_PLATFORM_WIN
 #include "rwin/IdFactory.h"

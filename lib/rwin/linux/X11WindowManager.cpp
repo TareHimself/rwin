@@ -1,4 +1,5 @@
-﻿#if RWIN_PLATFORM_LINUX_X11
+﻿#include "../macros_private.h"
+#if RWIN_PLATFORM_LINUX_X11
 #include "X11WindowManager.h"
 namespace rwin
 {

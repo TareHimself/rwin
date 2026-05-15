@@ -1,7 +1,8 @@
 from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMake, cmake_layout, CMakeDeps
 from conan.tools.gnu import PkgConfig, PkgConfigDeps
-import os 
+import os
+
 
 class RWin(ConanFile):
     name = "rwin"
@@ -14,24 +15,31 @@ class RWin(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     exports_sources = "CMakeLists.txt", "lib/*", "include/*"
     options = {
-            "shared": [True, False],
-        }
+        "shared": [True, False],
+        "compat": [True, False],
+    }
     default_options = {
         "shared": True,
+        "compat": False,
     }
-    
+
     def config_options(self):
         pass
 
     def requirements(self):
-        if self.settings.os == "Linux":
-            self.requires("wayland/1.22.0",options={"shared": True})
+        if self.options.compat:
+            self.requires("glfw/3.4")
+        elif self.settings.os == "Linux":
+            self.requires("wayland/1.22.0", options={"shared": True})
             self.requires("wayland-protocols/1.36")
             self.requires("xkbcommon/1.6.0")
             self.requires("libdecor/0.2.2")
 
     def build_requirements(self):
-        if self.settings.os == "Linux":
+        self.tool_requires("cmake/4.3.2")
+        if self.options.compat:
+            pass
+        elif self.settings.os == "Linux":
             if not self.conf.get("tools.gnu:pkg_config", default=False, check_type=str):
                 self.tool_requires("pkgconf/[2.2 <3]")
             # This is crucial: use wayland in the build context will make wayland-scanner available from CMake
@@ -44,18 +52,24 @@ class RWin(ConanFile):
         deps = CMakeDeps(self)
         deps.generate()
         tc = CMakeToolchain(self)
+        tc.cache_variables["RWIN_VERSION"] =  self.version
+        tc.cache_variables["RWIN_PLATFORM_COMPAT"] = self.options.compat
         tc.generate()
+        
         pkg_config_deps = PkgConfigDeps(self)
         pkg_config_deps.generate()
 
     def build(self):
         cmake = CMake(self)
-        cmake.configure(variables={
-            "RWIN_VERSION" : self.version
-            })
+        # cmake.configure(variables={
+        #     "RWIN_VERSION": self.version,
+        #     "RWIN_PLATFORM_COMPAT": "ON" if self.options.compat else "OFF",
+        # })
         cmake.build()
 
-        if self.settings.os == "Linux":
+        if self.options.compat:
+            pass
+        elif self.settings.os == "Linux":
             pkg_config = PkgConfig(self, "wayland-scanner", self.generators_folder)
 
     def package(self):
@@ -67,4 +81,3 @@ class RWin(ConanFile):
         self.cpp_info.set_property("cmake_target_name", "rwin::rwin")
         self.cpp_info.set_property("pkg_config_name", "rwin")
         self.cpp_info.libs = ["rwin"]
-            

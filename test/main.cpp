@@ -1,4 +1,5 @@
 #define RWIN_FLAGS_OPERATORS
+#include <chrono>
 #include <iostream>
 #include <vulkan/vulkan_core.h>
 #include "rwin/DropCallbacks.h"
@@ -90,15 +91,18 @@ void drawWindow(const std::uint64_t& windowId)
     vk::Extent2D targetSize{};
     targetSize.width = clientExtent.width;
     targetSize.height = clientExtent.height;
+
+
+    vk::detail::resultCheck(device.waitForFences(info.renderFence, true, std::numeric_limits<std::uint64_t>::max()),
+                            "failed to wait for fences");
+
     if (size != targetSize)
     {
         destroySwapchain(windowId, info);
         info.extent = targetSize;
         createSwapchain(windowId, info);
     }
-
-    vk::detail::resultCheck(device.waitForFences(info.renderFence, true, std::numeric_limits<std::uint64_t>::max()),
-                            "failed to wait for fences");
+    
     device.resetFences(info.renderFence);
     device.resetCommandPool(info.commandPool);
     auto acquireResult = device.acquireNextImageKHR(info.swapchain, std::numeric_limits<std::uint64_t>::max(),
@@ -122,14 +126,21 @@ void drawWindow(const std::uint64_t& windowId)
         .setNewLayout(vk::ImageLayout::eGeneral)
         .setImage(swapchainImage)
         .setSubresourceRange(subresourceRange);
-    depInfo.setImageMemoryBarriers(imageMemoryBarrier);
-    cmd.pipelineBarrier2(depInfo);
-    cmd.clearColorImage(swapchainImage, vk::ImageLayout::eGeneral,
-                        vk::ClearColorValue{}.setFloat32({1.0f, 1.0f, 1.0, 1.0f}), subresourceRange);
-    imageMemoryBarrier.setOldLayout(imageMemoryBarrier.newLayout);
-    imageMemoryBarrier.setNewLayout(vk::ImageLayout::ePresentSrcKHR);
-    cmd.pipelineBarrier2(depInfo);
-    cmd.end();
+        depInfo.setImageMemoryBarriers(imageMemoryBarrier);
+        cmd.pipelineBarrier2(depInfo);
+
+        static const auto startTime = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration<float>(now - startTime).count();
+        const auto pulse = 0.5f + 0.5f * std::sin(elapsed * 3.0f);
+
+        cmd.clearColorImage(swapchainImage, vk::ImageLayout::eGeneral,
+                            vk::ClearColorValue{}.setFloat32({0.0f, 0.1f, pulse, 1.0f}), subresourceRange);
+
+        imageMemoryBarrier.setOldLayout(imageMemoryBarrier.newLayout);
+        imageMemoryBarrier.setNewLayout(vk::ImageLayout::ePresentSrcKHR);
+        cmd.pipelineBarrier2(depInfo);
+        cmd.end();
 
     auto& renderSemaphore = info.renderSemaphores[swapchainImageIndex];
     vk::CommandBufferSubmitInfo cmdSubmitInfo{cmd};
@@ -229,7 +240,7 @@ int main()
 {
     initVulkan();
     const auto windowId = createWindow("Hello World", {1280, 720},
-                                       WindowFlags::Visible | WindowFlags::Frameless | WindowFlags::DragAndDrop);
+                                       WindowFlags::Visible | WindowFlags::Resizable | WindowFlags::DragAndDrop);
     initVulkanWindow(windowId);
     setWindowHitTestCallback(windowId, [windowId](const Vector2& point)
     {

@@ -2,11 +2,10 @@
 #include <cstdint>
 #include <span>
 #include <vulkan/vulkan.hpp>
-#include "macros.h"
 #include "types.h"
 #include "flags.h"
 #include <functional>
-
+#include "macros.h"
 #include "DropCallbacks.h"
 // EXPORT int platformGet();
 //

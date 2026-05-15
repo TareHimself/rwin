@@ -5,25 +5,25 @@ version: '3'
 tasks:
     build:
       cmds:
-        - cmd: conan create . --build=missing -s build_type=Release -s compiler.cppstd=20
-          platforms: [windows]
-        - cmd: conan create . --build=missing -s build_type=Release -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True
+        - cmd: conan create . --build=missing -s build_type=Release -s compiler.cppstd=20 {{.CLI_ARGS}}
+          platforms: [windows,darwin]
+        - cmd: conan create . --build=missing -s build_type=Release -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True {{.CLI_ARGS}}
           platforms: [linux]
     build-debug:
       cmds:
-        - cmd: conan create . --build=missing -s build_type=Debug  -s compiler.cppstd=20
-          platforms: [windows]
-        - cmd: conan create . --build=missing -s build_type=Debug  -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True
+        - cmd: conan create . --build=missing -s build_type=Debug  -s compiler.cppstd=20 {{.CLI_ARGS}}
+          platforms: [windows,darwin]
+        - cmd: conan create . --build=missing -s build_type=Debug  -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True {{.CLI_ARGS}}
           platforms: [linux]
     setup:
       cmds:
-        - cmd: conan install . --build=missing -s build_type=Release  -s compiler.cppstd=20
-          platforms: [windows]
-        - cmd: conan install . --build=missing -s build_type=Release  -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True
+        - cmd: conan install . --build=missing -s build_type=Release  -s compiler.cppstd=20 {{.CLI_ARGS}}
+          platforms: [windows,darwin]
+        - cmd: conan install . --build=missing -s build_type=Release  -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True {{.CLI_ARGS}}
           platforms: [linux]
     setup-debug:
       cmds:
-        - cmd: conan install . --build=missing -s build_type=Debug  -s compiler.cppstd=20
-          platforms: [windows]
-        - cmd: conan install . --build=missing -s build_type=Debug  -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True
+        - cmd: conan install . --build=missing -s build_type=Debug  -s compiler.cppstd=20 {{.CLI_ARGS}}
+          platforms: [windows,darwin]
+        - cmd: conan install . --build=missing -s build_type=Debug  -s compiler.cppstd=20 -c tools.system.package_manager:mode=install -c tools.system.package_manager:sudo=True {{.CLI_ARGS}}
           platforms: [linux]
