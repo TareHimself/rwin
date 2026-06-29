@@ -1,6 +1,6 @@
 .idea/
 cmake-build*
-CmakeUserPresets.json
+CMakeUserPresets.json
 vcpkg_installed
 /build
 /conan

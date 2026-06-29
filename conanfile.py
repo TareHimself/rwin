@@ -55,18 +55,15 @@ class RWin(ConanFile):
         tc.cache_variables["RWIN_VERSION"] =  self.version
         tc.cache_variables["RWIN_PLATFORM_COMPAT"] = self.options.compat
         tc.generate()
-        
-        pkg_config_deps = PkgConfigDeps(self)
-        pkg_config_deps.generate()
+
+        if self.settings.os == "Linux":
+            pkg_config_deps = PkgConfigDeps(self)
+            pkg_config_deps.generate()
 
     def build(self):
         cmake = CMake(self)
+        cmake.configure()
         cmake.build()
-
-        if self.options.compat:
-            pass
-        elif self.settings.os == "Linux":
-            pkg_config = PkgConfig(self, "wayland-scanner", self.generators_folder)
 
     def package(self):
         cmake = CMake(self)
