@@ -61,10 +61,6 @@ class RWin(ConanFile):
 
     def build(self):
         cmake = CMake(self)
-        # cmake.configure(variables={
-        #     "RWIN_VERSION": self.version,
-        #     "RWIN_PLATFORM_COMPAT": "ON" if self.options.compat else "OFF",
-        # })
         cmake.build()
 
         if self.options.compat:
