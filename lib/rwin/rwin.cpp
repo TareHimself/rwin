@@ -66,5 +66,21 @@ namespace rwin
         IWindowManager::Get()->ClearDropCallbacks(id);
     }
 
+    void startTextInput(const std::uint64_t& id, const Rect2D& caret){
+        IWindowManager::Get()->StartTextInput(id, caret);
+    }
+
+    void stopTextInput(const std::uint64_t& id){
+        IWindowManager::Get()->StopTextInput(id);
+    }
+
+    void setTextInputRect(const std::uint64_t& id, const Rect2D& caret){
+        IWindowManager::Get()->SetTextInputRect(id, caret);
+    }
+
+    std::u16string_view getEventText(const TextRef& ref){
+        return IWindowManager::Get()->GetEventText(ref);
+    }
+
 
 }

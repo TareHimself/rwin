@@ -4,6 +4,7 @@
 #ifdef RWIN_PLATFORM_WIN
 #include "rwin/IdFactory.h"
 #include "rwin/IWindowManager.h"
+#include "../TextArena.h"
 #include <list>
 #include <ObjectArray.h>
 #include <string>
@@ -18,6 +19,8 @@ namespace rwin
         std::uint64_t id{0};
         HWND hwnd{nullptr};
         bool trackingMouse{false};
+        bool textInputActive{false};
+        char16_t pendingHighSurrogate{0}; // first half of a pair, waiting for its WM_CHAR partner
         IDropTarget* dropTarget{nullptr};
         std::optional<DropCallbacks> dropCallbacks{};
         std::optional<std::function<HitTestResult(const Vector2&)>> hitTestFunction{};
@@ -51,6 +54,10 @@ namespace rwin
         float GetDefaultDpi() override;
         void SetDropCallbacks(const std::uint64_t& id, const DropCallbacks& callbacks) override;
         void ClearDropCallbacks(const std::uint64_t& id) override;
+        void StartTextInput(const std::uint64_t& id, const Rect2D& caret) override;
+        void StopTextInput(const std::uint64_t& id) override;
+        std::u16string_view GetEventText(const TextRef& ref) override;
+        TextArena textArena{};
 
     private:
         std::unordered_map<std::uint64_t, WindowInfo> _windows;

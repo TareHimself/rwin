@@ -1,12 +1,14 @@
 #pragma once
 #include "rwin/IWindowManager.h"
 #include "../macros_private.h"
+#include <memory>
 
 #ifdef RWIN_PLATFORM_COMPAT
 namespace rwin
 {
     class GLFWWindowManager : public IWindowManager {
     public:
+        GLFWWindowManager();
         ~GLFWWindowManager() override;
 
         vk::SurfaceKHR CreateSurface(const std::uint64_t &id, const vk::Instance &instance) override;
@@ -48,6 +50,17 @@ namespace rwin
         void SetDropCallbacks(const std::uint64_t &id, const DropCallbacks &callbacks) override;
 
         void ClearDropCallbacks(const std::uint64_t &id) override;
+
+        void StartTextInput(const std::uint64_t &id, const Rect2D &caret) override;
+
+        void StopTextInput(const std::uint64_t &id) override;
+
+        std::u16string_view GetEventText(const TextRef &ref) override;
+
+    private:
+        // Window table and event queue live per manager; defined in the .cpp to keep GLFW out of the header.
+        struct Impl;
+        std::unique_ptr<Impl> _impl;
     };
 }
 #endif

@@ -30,10 +30,11 @@ namespace rwin
         int y;
     };
 
+    // Signed like vk::Offset2D: positions can sit left of or above an origin (e.g. a scrolled-off caret).
     struct Offset2D
     {
-        uint32_t x;
-        uint32_t y;
+        int32_t x;
+        int32_t y;
     };
 
     struct Extent2D
@@ -92,12 +93,13 @@ namespace rwin
         CursorMove,
         CursorButton,
         Close,
-        Text,
+        TextCommit,
         CursorFocus,
         KeyboardFocus,
         DndEnter,
         DndDrop,
-        DndLeave
+        DndLeave,
+        TextPreedit
     };
 
     enum class InputState : uint32_t
@@ -321,11 +323,30 @@ namespace rwin
 
     };
 
-    struct TextEvent
+    // Where an event's text lives, in char16_t units. Resolve it with IWindowManager::GetEventText.
+    struct TextRef
+    {
+        std::uint32_t offset;
+        std::uint32_t length;
+    };
+
+    // Finished text to insert at the caret. UTF-16, so non-BMP characters arrive as surrogate pairs.
+    struct TextCommitEvent
     {
         WindowEventType type;
         std::uint64_t windowId;
-        char16_t text;
+        TextRef text;
+    };
+
+    // In-progress IME composition. Each event replaces the previous preedit; empty text clears it.
+    // caretStart/caretEnd are char16_t offsets into text (equal when it is just a caret).
+    struct TextPreeditEvent
+    {
+        WindowEventType type;
+        std::uint64_t windowId;
+        TextRef text;
+        std::uint32_t caretStart;
+        std::uint32_t caretEnd;
     };
 
     struct WindowEvent
@@ -343,7 +364,8 @@ namespace rwin
             FocusEvent cursorFocus;
             FocusEvent keyboardFocus;
             CloseEvent close;
-            TextEvent text;
+            TextCommitEvent textCommit;
+            TextPreeditEvent textPreedit;
         };
     };
 }

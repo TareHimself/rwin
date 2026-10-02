@@ -12,39 +12,23 @@
 #include <vulkan/vulkan.h>
 
 #include "rwin/IdFactory.h"
+#include "../TextArena.h"
 
 namespace rwin {
     namespace {
         struct WindowInfo {
             std::uint64_t id{};
             GLFWwindow* window{};
+            // Owning manager's queue; GLFW's C callbacks reach it through the window user pointer.
+            std::deque<WindowEvent>* events{};
+            TextArena* text{};
+            bool textInputActive{false};
             std::function<HitTestResult(const Vector2&)> hitTestCallback{};
             DropCallbacks dropCallbacks{};
-            bool hasHitTestCallback{false};
-            bool hasDropCallbacks{false};
         };
 
-        IdFactory g_idFactory{};
-        std::unordered_map<std::uint64_t, std::unique_ptr<WindowInfo>> g_windows{};
-        std::unordered_map<GLFWwindow*, std::uint64_t> g_windowIds{};
-        std::deque<WindowEvent> g_pendingEvents{};
-
-        WindowInfo* GetWindowInfo(const std::uint64_t& id) {
-            const auto found = g_windows.find(id);
-            if (found == g_windows.end()) {
-                return nullptr;
-            }
-
-            return found->second.get();
-        }
-
         WindowInfo* GetWindowInfo(GLFWwindow* window) {
-            const auto found = g_windowIds.find(window);
-            if (found == g_windowIds.end()) {
-                return nullptr;
-            }
-
-            return GetWindowInfo(found->second);
+            return static_cast<WindowInfo*>(glfwGetWindowUserPointer(window));
         }
 
         InputState ToInputState(const int action) {
@@ -216,7 +200,10 @@ namespace rwin {
         }
 
         void RegisterCallbacks(GLFWwindow* window) {
-            glfwSetWindowSizeCallback(window, [](GLFWwindow* glfwWindow, const int width, const int height) {
+            // Framebuffer size (physical pixels), not window size (points on HiDPI displays) -
+            // matches GetClientSize()'s glfwGetFramebufferSize so live resize events and polled
+            // size stay in the same unit.
+            glfwSetFramebufferSizeCallback(window, [](GLFWwindow* glfwWindow, const int width, const int height) {
                 const auto info = GetWindowInfo(glfwWindow);
                 if (!info) {
                     return;
@@ -231,7 +218,7 @@ namespace rwin {
                         .height = static_cast<std::uint32_t>(height)
                     }
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetWindowCloseCallback(window, [](GLFWwindow* glfwWindow) {
@@ -247,7 +234,7 @@ namespace rwin {
                     .type = WindowEventType::Close,
                     .windowId = info->id,
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetKeyCallback(window, [](GLFWwindow* glfwWindow, const int key, int, const int action, const int mods) {
@@ -264,22 +251,34 @@ namespace rwin {
                     .state = ToInputState(action),
                     .modifier = ToInputModifier(mods),
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetCharCallback(window, [](GLFWwindow* glfwWindow, const unsigned int codepoint) {
                 const auto info = GetWindowInfo(glfwWindow);
-                if (!info) {
+                if (!info || !info->textInputActive) {
                     return;
                 }
 
+                // GLFW hands over a UTF-32 codepoint; events carry UTF-16.
+                char16_t units[2]{};
+                std::size_t count = 1;
+                if (codepoint < 0x10000) {
+                    units[0] = static_cast<char16_t>(codepoint);
+                } else {
+                    const auto offset = codepoint - 0x10000;
+                    units[0] = static_cast<char16_t>(0xD800 + (offset >> 10));
+                    units[1] = static_cast<char16_t>(0xDC00 + (offset & 0x3FF));
+                    count = 2;
+                }
+
                 WindowEvent event{};
-                new (&event.text) TextEvent{
-                    .type = WindowEventType::Text,
+                new (&event.textCommit) TextCommitEvent{
+                    .type = WindowEventType::TextCommit,
                     .windowId = info->id,
-                    .text = static_cast<char16_t>(codepoint),
+                    .text = info->text->Append({units, count}),
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetCursorPosCallback(window, [](GLFWwindow* glfwWindow, const double x, const double y) {
@@ -297,7 +296,7 @@ namespace rwin {
                         .y = static_cast<float>(y),
                     },
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetCursorEnterCallback(window, [](GLFWwindow* glfwWindow, const int entered) {
@@ -312,7 +311,7 @@ namespace rwin {
                     .windowId = info->id,
                     .focused = entered,
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetWindowFocusCallback(window, [](GLFWwindow* glfwWindow, const int focused) {
@@ -327,7 +326,7 @@ namespace rwin {
                     .windowId = info->id,
                     .focused = focused,
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetMouseButtonCallback(window, [](GLFWwindow* glfwWindow, const int button, const int action, const int mods) {
@@ -344,7 +343,7 @@ namespace rwin {
                     .state = ToInputState(action),
                     .modifier = ToInputModifier(mods),
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetScrollCallback(window, [](GLFWwindow* glfwWindow, const double xOffset, const double yOffset) {
@@ -370,12 +369,12 @@ namespace rwin {
                         .y = static_cast<float>(yOffset),
                     },
                 };
-                g_pendingEvents.push_back(event);
+                info->events->push_back(event);
             });
 
             glfwSetDropCallback(window, [](GLFWwindow* glfwWindow, const int count, const char** paths) {
                 const auto info = GetWindowInfo(glfwWindow);
-                if (!info || !info->hasDropCallbacks || !info->dropCallbacks.drop) {
+                if (!info || !info->dropCallbacks.drop) {
                     return;
                 }
 
@@ -419,22 +418,37 @@ namespace rwin {
         }
     }
 
+    struct GLFWWindowManager::Impl {
+        IdFactory idFactory{};
+        std::unordered_map<std::uint64_t, std::unique_ptr<WindowInfo>> windows{};
+        std::deque<WindowEvent> pendingEvents{};
+        TextArena text{};
+
+        WindowInfo* Find(const std::uint64_t id) {
+            const auto found = windows.find(id);
+            return found != windows.end() ? found->second.get() : nullptr;
+        }
+
+        // Ids are recycled, so events still queued for a destroyed window must not reach its successor.
+        void PurgeEvents(const std::uint64_t id) {
+            std::erase_if(pendingEvents, [id](const WindowEvent& e) { return e.close.windowId == id; });
+        }
+    };
+
+    GLFWWindowManager::GLFWWindowManager() : _impl(std::make_unique<Impl>()) {}
+
     GLFWWindowManager::~GLFWWindowManager() {
-        for (const auto& [id, info] : g_windows) {
+        for (const auto& [id, info] : _impl->windows) {
             if (info->window) {
                 glfwDestroyWindow(info->window);
             }
         }
 
-        g_windows.clear();
-        g_windowIds.clear();
-        g_pendingEvents.clear();
-
         glfwTerminate();
     }
 
     vk::SurfaceKHR GLFWWindowManager::CreateSurface(const std::uint64_t& id, const vk::Instance& instance) {
-        const auto info = GetWindowInfo(id);
+        const auto info = _impl->Find(id);
         if (!info) {
             return {};
         }
@@ -451,12 +465,12 @@ namespace rwin {
         std::uint64_t gotten = 0;
 
         for (auto& event : events) {
-            if (g_pendingEvents.empty()) {
+            if (_impl->pendingEvents.empty()) {
                 break;
             }
 
-            event = g_pendingEvents.front();
-            g_pendingEvents.pop_front();
+            event = _impl->pendingEvents.front();
+            _impl->pendingEvents.pop_front();
             ++gotten;
         }
 
@@ -490,14 +504,16 @@ namespace rwin {
             return 0;
         }
 
-        const auto id = g_idFactory.New();
+        const auto id = _impl->idFactory.New();
 
         auto info = std::make_unique<WindowInfo>();
         info->id = id;
         info->window = window;
+        info->events = &_impl->pendingEvents;
+        info->text = &_impl->text;
 
-        g_windowIds.emplace(window, id);
-        g_windows.emplace(id, std::move(info));
+        glfwSetWindowUserPointer(window, info.get());
+        _impl->windows.emplace(id, std::move(info));
 
         RegisterCallbacks(window);
 
@@ -505,20 +521,19 @@ namespace rwin {
     }
 
     void GLFWWindowManager::Destroy(const std::uint64_t& id) {
-        const auto found = g_windows.find(id);
-        if (found == g_windows.end()) {
+        const auto found = _impl->windows.find(id);
+        if (found == _impl->windows.end()) {
             return;
         }
 
-        const auto window = found->second->window;
-        g_windowIds.erase(window);
-        glfwDestroyWindow(window);
-        g_windows.erase(found);
-        g_idFactory.Free(id);
+        glfwDestroyWindow(found->second->window);
+        _impl->PurgeEvents(id);
+        _impl->windows.erase(found);
+        _impl->idFactory.Free(id);
     }
 
     Extent2D GLFWWindowManager::GetClientSize(const std::uint64_t& id) {
-        const auto info = GetWindowInfo(id);
+        const auto info = _impl->Find(id);
         if (!info) {
             return {};
         }
@@ -534,7 +549,7 @@ namespace rwin {
     }
 
     Point2D GLFWWindowManager::GetClientPosition(const std::uint64_t& id) {
-        const auto info = GetWindowInfo(id);
+        const auto info = _impl->Find(id);
         if (!info) {
             return {};
         }
@@ -550,7 +565,7 @@ namespace rwin {
     }
 
     Vector2 GLFWWindowManager::GetCursorPosition(const std::uint64_t& id) {
-        const auto info = GetWindowInfo(id);
+        const auto info = _impl->Find(id);
         if (!info) {
             return {};
         }
@@ -559,6 +574,20 @@ namespace rwin {
         double y{};
         glfwGetCursorPos(info->window, &x, &y);
 
+        // Cursor coordinates are in window units, but GetClientSize() reports framebuffer pixels.
+        // Scale by the framebuffer/window ratio (1.0 on Windows and X11, 2.0 on Retina); content
+        // scale would wrongly double-scale on Windows where window units are already pixels.
+        int windowW{};
+        int windowH{};
+        int fbW{};
+        int fbH{};
+        glfwGetWindowSize(info->window, &windowW, &windowH);
+        glfwGetFramebufferSize(info->window, &fbW, &fbH);
+        if (windowW > 0 && windowH > 0) {
+            x *= static_cast<double>(fbW) / windowW;
+            y *= static_cast<double>(fbH) / windowH;
+        }
+
         return Vector2{
             .x = static_cast<float>(x),
             .y = static_cast<float>(y),
@@ -566,31 +595,31 @@ namespace rwin {
     }
 
     void GLFWWindowManager::Show(const std::uint64_t& id) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             glfwShowWindow(info->window);
         }
     }
 
     void GLFWWindowManager::Hide(const std::uint64_t& id) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             glfwHideWindow(info->window);
         }
     }
 
     void GLFWWindowManager::Minimize(const std::uint64_t& id) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             glfwIconifyWindow(info->window);
         }
     }
 
     void GLFWWindowManager::Maximize(const std::uint64_t& id) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             glfwMaximizeWindow(info->window);
         }
     }
 
     float GLFWWindowManager::GetDpi(const std::uint64_t& id) {
-        const auto info = GetWindowInfo(id);
+        const auto info = _impl->Find(id);
         if (!info) {
             return GetDefaultDpi();
         }
@@ -653,7 +682,28 @@ namespace rwin {
     }
 
     void GLFWWindowManager::PumpEvents() {
+        // Texts of events still queued must stay readable, so only reset once the queue is empty.
+        if (_impl->pendingEvents.empty()) {
+            _impl->text.Reset();
+        }
         glfwPollEvents();
+    }
+
+    void GLFWWindowManager::StartTextInput(const std::uint64_t& id, const Rect2D&) {
+        // GLFW exposes no IME composition, so the caret rect has nowhere to go and no preedit is emitted.
+        if (const auto info = _impl->Find(id)) {
+            info->textInputActive = true;
+        }
+    }
+
+    void GLFWWindowManager::StopTextInput(const std::uint64_t& id) {
+        if (const auto info = _impl->Find(id)) {
+            info->textInputActive = false;
+        }
+    }
+
+    std::u16string_view GLFWWindowManager::GetEventText(const TextRef& ref) {
+        return _impl->text.View(ref);
     }
 
     void GLFWWindowManager::GetRequiredExtensions(std::vector<const char*>& extensions) {
@@ -674,30 +724,26 @@ namespace rwin {
 
     void GLFWWindowManager::SetHitTestCallback(const std::uint64_t& id,
         const std::function<HitTestResult(const Vector2&)>& callback) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             info->hitTestCallback = callback;
-            info->hasHitTestCallback = true;
         }
     }
 
     void GLFWWindowManager::ClearHitTestCallback(const std::uint64_t& id) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             info->hitTestCallback = {};
-            info->hasHitTestCallback = false;
         }
     }
 
     void GLFWWindowManager::SetDropCallbacks(const std::uint64_t& id, const DropCallbacks& callbacks) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             info->dropCallbacks = callbacks;
-            info->hasDropCallbacks = true;
         }
     }
 
     void GLFWWindowManager::ClearDropCallbacks(const std::uint64_t& id) {
-        if (const auto info = GetWindowInfo(id)) {
+        if (const auto info = _impl->Find(id)) {
             info->dropCallbacks = {};
-            info->hasDropCallbacks = false;
         }
     }
 }

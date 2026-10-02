@@ -6,6 +6,43 @@
 #include "rwin/rwin.h"
 using namespace rwin;
 
+// Minimal UTF-16 -> UTF-8 so event text can be printed to the console.
+std::string toUtf8(const std::u16string_view text)
+{
+    std::string out;
+    for (std::size_t i = 0; i < text.size(); ++i)
+    {
+        char32_t cp = text[i];
+        if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < text.size())
+        {
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (text[++i] - 0xDC00);
+        }
+        if (cp < 0x80)
+        {
+            out += static_cast<char>(cp);
+        }
+        else if (cp < 0x800)
+        {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else if (cp < 0x10000)
+        {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else
+        {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    return out;
+}
+
 struct WindowVulkanInfo
 {
     vk::Fence renderFence;
@@ -242,6 +279,7 @@ int main()
     const auto windowId = createWindow("Hello World", {1280, 720},
                                        WindowFlags::Visible | WindowFlags::Resizable | WindowFlags::DragAndDrop);
     initVulkanWindow(windowId);
+    startTextInput(windowId, Rect2D{.offset = {100, 100}, .extent = {2, 24}});
     setWindowHitTestCallback(windowId, [windowId](const Vector2& point)
     {
         auto resizeBorderSize = 20;
@@ -324,6 +362,13 @@ int main()
             {
             case WindowEventType::Close:
                 quit = true;
+                break;
+            case WindowEventType::TextCommit:
+                std::cout << "commit: " << toUtf8(getEventText(event.textCommit.text)) << std::endl;
+                break;
+            case WindowEventType::TextPreedit:
+                std::cout << "preedit: [" << toUtf8(getEventText(event.textPreedit.text)) << "] caret "
+                          << event.textPreedit.caretStart << "-" << event.textPreedit.caretEnd << std::endl;
                 break;
             case WindowEventType::Key:
                 {

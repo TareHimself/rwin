@@ -563,11 +563,40 @@ namespace rwin
             }
         case WM_CHAR:
             {
+                if (!windowInfo->textInputActive)
+                {
+                    return 0;
+                }
+
+                // Backspace, Enter, Tab and Escape arrive as WM_CHAR too; those are keys, not text.
+                const auto unit = static_cast<char16_t>(wParam);
+                if (unit < 0x20 || unit == 0x7F)
+                {
+                    return 0;
+                }
+
+                // Non-BMP characters arrive as two WM_CHAR messages; emit them as one commit.
+                if (IS_HIGH_SURROGATE(unit))
+                {
+                    windowInfo->pendingHighSurrogate = unit;
+                    return 0;
+                }
+
+                char16_t units[2]{unit, 0};
+                std::size_t count = 1;
+                if (IS_LOW_SURROGATE(unit) && windowInfo->pendingHighSurrogate != 0)
+                {
+                    units[0] = windowInfo->pendingHighSurrogate;
+                    units[1] = unit;
+                    count = 2;
+                }
+                windowInfo->pendingHighSurrogate = 0;
+
                 WindowEvent ev{};
-                new(&ev.text) TextEvent{
-                    .type = WindowEventType::Text,
+                new(&ev.textCommit) TextCommitEvent{
+                    .type = WindowEventType::TextCommit,
                     .windowId = windowInfo->id,
-                    .text = static_cast<char16_t>(wParam)
+                    .text = MANAGER_INSTANCE->textArena.Append({units, count}),
                 };
                 MANAGER_INSTANCE->pendingEvents.push_back(ev);
                 return 0;
@@ -868,12 +897,42 @@ namespace rwin
 
     void WindowsWindowManager::PumpEvents()
     {
+        // Texts of events still queued must stay readable, so only reset once the queue is empty.
+        if (pendingEvents.empty())
+        {
+            textArena.Reset();
+        }
+
         MSG msg;
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE) > 0)
         {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+    }
+
+    // TODO(windows): composition is system-drawn at the default position. Wire the caret rect through
+    // ImmSetCompositionWindow/ImmSetCandidateWindow so the IME popup follows the text cursor.
+    void WindowsWindowManager::StartTextInput(const std::uint64_t& id, const Rect2D&)
+    {
+        if (const auto info = GetWindowInfo(id))
+        {
+            info->textInputActive = true;
+        }
+    }
+
+    void WindowsWindowManager::StopTextInput(const std::uint64_t& id)
+    {
+        if (const auto info = GetWindowInfo(id))
+        {
+            info->textInputActive = false;
+            info->pendingHighSurrogate = 0;
+        }
+    }
+
+    std::u16string_view WindowsWindowManager::GetEventText(const TextRef& ref)
+    {
+        return textArena.View(ref);
     }
 
     WindowInfo* WindowsWindowManager::GetWindowInfo(const std::uint64_t& id)

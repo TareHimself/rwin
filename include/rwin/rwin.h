@@ -26,4 +26,8 @@ namespace rwin
     RWIN_API void clearWindowHitTestCallback(const std::uint64_t& id);
     RWIN_API void setWindowDropCallbacks(const std::uint64_t& id, const DropCallbacks& callbacks);
     RWIN_API void clearWindowDropCallbacks(const std::uint64_t& id);
+    RWIN_API void startTextInput(const std::uint64_t& id, const Rect2D& caret);
+    RWIN_API void stopTextInput(const std::uint64_t& id);
+    RWIN_API void setTextInputRect(const std::uint64_t& id, const Rect2D& caret);
+    RWIN_API std::u16string_view getEventText(const TextRef& ref);
 }
