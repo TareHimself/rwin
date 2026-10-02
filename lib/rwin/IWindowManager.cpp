@@ -1,7 +1,7 @@
-#include "rwin/IWindowManager.h"
 #include "macros_private.h"
+#include "rwin/IWindowManager.h"
 
-#ifdef RWIN_PLATFORM_COMPAT
+#if defined(RWIN_PLATFORM_COMPAT)
 #include "glfw/GLFWWindowManager.h"
 namespace rwin {
     IWindowManager *IWindowManager::Get() {
@@ -26,9 +26,10 @@ namespace rwin {
     }
 }
 #elif defined(RWIN_PLATFORM_DARWIN)
+#include "darwin/DarwinWindowManager.h"
 namespace rwin {
     IWindowManager *IWindowManager::Get() {
-        static auto instance = std::make_unique<IWindowManager>();
+        static auto instance = std::make_unique<DarwinWindowManager>();
         return instance.get();
     }
 }

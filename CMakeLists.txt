@@ -96,6 +96,18 @@ else()
 
     endif()
 
+    if(APPLE)
+        target_link_libraries(${PROJECT_NAME} PRIVATE
+            "-framework AppKit"
+            "-framework Metal"
+            "-framework QuartzCore"
+        )
+        set_source_files_properties(
+            lib/rwin/darwin/DarwinWindowManager.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+        )
+    endif()
+
 endif()
 
 # Install headers
