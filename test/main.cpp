@@ -1,46 +1,24 @@
 #define RWIN_FLAGS_OPERATORS
+#include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <iostream>
+#include <stdexcept>
+#include <thread>
 #include <vulkan/vulkan_core.h>
+#include <imgui_impl_vulkan.h>
 #include "rwin/DropCallbacks.h"
 #include "rwin/rwin.h"
+#include "ImGuiRwin.h"
 using namespace rwin;
 
-// Minimal UTF-16 -> UTF-8 so event text can be printed to the console.
-std::string toUtf8(const std::u16string_view text)
+static void checkResult(const vk::Result result, const char* message)
 {
-    std::string out;
-    for (std::size_t i = 0; i < text.size(); ++i)
+    if (result != vk::Result::eSuccess)
     {
-        char32_t cp = text[i];
-        if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < text.size())
-        {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (text[++i] - 0xDC00);
-        }
-        if (cp < 0x80)
-        {
-            out += static_cast<char>(cp);
-        }
-        else if (cp < 0x800)
-        {
-            out += static_cast<char>(0xC0 | (cp >> 6));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-        else if (cp < 0x10000)
-        {
-            out += static_cast<char>(0xE0 | (cp >> 12));
-            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-        else
-        {
-            out += static_cast<char>(0xF0 | (cp >> 18));
-            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        }
+        throw std::runtime_error(message);
     }
-    return out;
 }
 
 struct WindowVulkanInfo
@@ -55,6 +33,8 @@ struct WindowVulkanInfo
     std::vector<vk::Image> images;
     std::vector<vk::ImageView> imageViews;
     std::vector<vk::Semaphore> renderSemaphores;
+    vk::Format format;
+    bool stale = false;
 };
 
 vk::Instance instance;
@@ -63,6 +43,8 @@ vk::Device device;
 vk::Queue queue;
 std::uint32_t queueFamilyIndex;
 std::unordered_map<std::uint64_t, WindowVulkanInfo> windows;
+vk::DescriptorPool imguiPool;
+bool imguiVulkanReady = false;
 
 void destroySwapchain(const std::uint64_t& windowId, WindowVulkanInfo& info)
 {
@@ -70,6 +52,7 @@ void destroySwapchain(const std::uint64_t& windowId, WindowVulkanInfo& info)
     {
         return;
     }
+    device.waitIdle();
     for (auto renderSemaphore : info.renderSemaphores)
     {
         device.destroySemaphore(renderSemaphore);
@@ -104,6 +87,7 @@ void createSwapchain(const std::uint64_t& windowId, WindowVulkanInfo& info)
                        .setImageColorSpace(format.colorSpace)
                        .setImageExtent(info.extent)
                        .setImageArrayLayers(1);
+    info.format = format.format;
     info.swapchain = device.createSwapchainKHR(swapchainCreateInfo);
     info.images = device.getSwapchainImagesKHR(info.swapchain);
     vk::ImageSubresourceRange subresourceRange{
@@ -119,65 +103,130 @@ void createSwapchain(const std::uint64_t& windowId, WindowVulkanInfo& info)
     }
 }
 
+void initImGuiVulkan(const WindowVulkanInfo& info)
+{
+    const vk::DescriptorPoolSize poolSize{vk::DescriptorType::eCombinedImageSampler, 16};
+    imguiPool = device.createDescriptorPool(
+        vk::DescriptorPoolCreateInfo{vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 16, poolSize});
+
+    static VkFormat colorFormat;
+    colorFormat = static_cast<VkFormat>(info.format);
+
+    ImGui_ImplVulkan_InitInfo initInfo{};
+    initInfo.Instance = static_cast<VkInstance>(instance);
+    initInfo.PhysicalDevice = static_cast<VkPhysicalDevice>(physicalDevice);
+    initInfo.Device = static_cast<VkDevice>(device);
+    initInfo.QueueFamily = queueFamilyIndex;
+    initInfo.Queue = static_cast<VkQueue>(queue);
+    initInfo.DescriptorPool = static_cast<VkDescriptorPool>(imguiPool);
+    initInfo.MinImageCount = 2;
+    initInfo.ImageCount = std::max<std::uint32_t>(2, static_cast<std::uint32_t>(info.images.size()));
+    initInfo.UseDynamicRendering = true;
+    initInfo.PipelineRenderingCreateInfo = VkPipelineRenderingCreateInfoKHR{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
+        .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &colorFormat,
+    };
+    ImGui_ImplVulkan_Init(&initInfo);
+}
+
 void drawWindow(const std::uint64_t& windowId)
 {
-    auto clientExtent = getWindowClientSize(windowId);
+    const auto clientExtent = getWindowClientSize(windowId);
+    if (clientExtent.width == 0 || clientExtent.height == 0)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        return;
+    }
+
     auto& info = windows[windowId];
-    auto size = info.extent;
-    auto caps = physicalDevice.getSurfaceCapabilitiesKHR(info.surface);
-    vk::Extent2D targetSize{};
-    targetSize.width = clientExtent.width;
-    targetSize.height = clientExtent.height;
+    const vk::Extent2D targetSize{clientExtent.width, clientExtent.height};
 
+    checkResult(device.waitForFences(info.renderFence, true, std::numeric_limits<std::uint64_t>::max()),
+                "failed to wait for fences");
 
-    vk::detail::resultCheck(device.waitForFences(info.renderFence, true, std::numeric_limits<std::uint64_t>::max()),
-                            "failed to wait for fences");
-
-    if (size != targetSize)
+    if (info.extent != targetSize || info.stale)
     {
         destroySwapchain(windowId, info);
         info.extent = targetSize;
         createSwapchain(windowId, info);
+        info.stale = false;
     }
-    
+
+    if (!imguiVulkanReady)
+    {
+        initImGuiVulkan(info);
+        imguiVulkanReady = true;
+    }
+
+    static auto lastFrame = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const auto deltaTime = std::chrono::duration<float>(now - lastFrame).count();
+    lastFrame = now;
+
+    ImGui_ImplVulkan_NewFrame();
+    imguirwin::newFrame(deltaTime);
+    ImGui::NewFrame();
+    imguirwin::drawUi();
+    ImGui::Render();
+    imguirwin::endFrame();
+
+    std::uint32_t swapchainImageIndex = 0;
+    try
+    {
+        const auto acquireResult = device.acquireNextImageKHR(
+            info.swapchain, std::numeric_limits<std::uint64_t>::max(), info.swapchainSemaphore, {});
+        swapchainImageIndex = acquireResult.value;
+        info.stale = acquireResult.result == vk::Result::eSuboptimalKHR;
+    }
+    catch (const vk::OutOfDateKHRError&)
+    {
+        info.stale = true;
+        return;
+    }
+
     device.resetFences(info.renderFence);
     device.resetCommandPool(info.commandPool);
-    auto acquireResult = device.acquireNextImageKHR(info.swapchain, std::numeric_limits<std::uint64_t>::max(),
-                                                    info.swapchainSemaphore, {});
-    std::uint32_t swapchainImageIndex = acquireResult.value;
 
-    auto& swapchainImage = info.images[swapchainImageIndex];
+    const auto swapchainImage = info.images[swapchainImageIndex];
     auto cmd = info.commandBuffer;
     cmd.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-    vk::DependencyInfo depInfo{};
-    vk::ImageMemoryBarrier2 imageMemoryBarrier{};
-    vk::ImageSubresourceRange subresourceRange{
+
+    const vk::ImageSubresourceRange subresourceRange{
         vk::ImageAspectFlagBits::eColor, 0, vk::RemainingMipLevels, 0, vk::RemainingArrayLayers
     };
-    imageMemoryBarrier
-        .setSrcAccessMask(vk::AccessFlagBits2::eMemoryRead)
-        .setDstAccessMask(vk::AccessFlags2{vk::AccessFlagBits2::eMemoryWrite} | vk::AccessFlagBits2::eMemoryRead)
-        .setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands)
-        .setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands)
-        .setOldLayout(vk::ImageLayout::eUndefined)
-        .setNewLayout(vk::ImageLayout::eGeneral)
-        .setImage(swapchainImage)
-        .setSubresourceRange(subresourceRange);
-        depInfo.setImageMemoryBarriers(imageMemoryBarrier);
-        cmd.pipelineBarrier2(depInfo);
+    const auto transition = [&](const vk::ImageLayout from, const vk::ImageLayout to)
+    {
+        vk::ImageMemoryBarrier2 barrier{};
+        barrier.setSrcStageMask(vk::PipelineStageFlagBits2::eAllCommands)
+               .setSrcAccessMask(vk::AccessFlagBits2::eMemoryWrite)
+               .setDstStageMask(vk::PipelineStageFlagBits2::eAllCommands)
+               .setDstAccessMask(vk::AccessFlags2{vk::AccessFlagBits2::eMemoryWrite} | vk::AccessFlagBits2::eMemoryRead)
+               .setOldLayout(from)
+               .setNewLayout(to)
+               .setImage(swapchainImage)
+               .setSubresourceRange(subresourceRange);
+        vk::DependencyInfo dependencyInfo{};
+        dependencyInfo.setImageMemoryBarriers(barrier);
+        cmd.pipelineBarrier2(dependencyInfo);
+    };
 
-        static const auto startTime = std::chrono::steady_clock::now();
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed = std::chrono::duration<float>(now - startTime).count();
-        const auto pulse = 0.5f + 0.5f * std::sin(elapsed * 3.0f);
+    transition(vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal);
 
-        cmd.clearColorImage(swapchainImage, vk::ImageLayout::eGeneral,
-                            vk::ClearColorValue{}.setFloat32({0.0f, 0.1f, pulse, 1.0f}), subresourceRange);
+    vk::RenderingAttachmentInfo colorAttachment{};
+    colorAttachment.setImageView(info.imageViews[swapchainImageIndex])
+                   .setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
+                   .setLoadOp(vk::AttachmentLoadOp::eClear)
+                   .setStoreOp(vk::AttachmentStoreOp::eStore)
+                   .setClearValue(vk::ClearValue{vk::ClearColorValue{std::array<float, 4>{0.07f, 0.07f, 0.09f, 1.0f}}});
+    vk::RenderingInfo renderingInfo{};
+    renderingInfo.setRenderArea(vk::Rect2D{{0, 0}, info.extent}).setLayerCount(1).setColorAttachments(colorAttachment);
+    cmd.beginRendering(renderingInfo);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), static_cast<VkCommandBuffer>(cmd));
+    cmd.endRendering();
 
-        imageMemoryBarrier.setOldLayout(imageMemoryBarrier.newLayout);
-        imageMemoryBarrier.setNewLayout(vk::ImageLayout::ePresentSrcKHR);
-        cmd.pipelineBarrier2(depInfo);
-        cmd.end();
+    transition(vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR);
+    cmd.end();
 
     auto& renderSemaphore = info.renderSemaphores[swapchainImageIndex];
     vk::CommandBufferSubmitInfo cmdSubmitInfo{cmd};
@@ -191,10 +240,24 @@ void drawWindow(const std::uint64_t& windowId)
     queue.submit2(submitInfo, info.renderFence);
 
     vk::PresentInfoKHR presentInfo{};
-
     presentInfo.setWaitSemaphores(renderSemaphore).setSwapchains(info.swapchain).setImageIndices(swapchainImageIndex);
 
-    vk::detail::resultCheck(queue.presentKHR(presentInfo), "Failed to present");
+    try
+    {
+        const auto presentResult = queue.presentKHR(presentInfo);
+        if (presentResult == vk::Result::eSuboptimalKHR)
+        {
+            info.stale = true;
+        }
+        else
+        {
+            checkResult(presentResult, "Failed to present");
+        }
+    }
+    catch (const vk::OutOfDateKHRError&)
+    {
+        info.stale = true;
+    }
 }
 
 
@@ -255,11 +318,12 @@ void initVulkan()
     deviceQueueCreateInfo.setQueuePriorities(priority);
     vk::DeviceCreateInfo deviceCreateInfo{};
     vk::PhysicalDeviceFeatures deviceFeatures{};
-    vk::PhysicalDeviceSynchronization2Features sync2Features{};
-    sync2Features.setSynchronization2(true);
+    vk::PhysicalDeviceVulkan13Features vulkan13Features{};
+    vulkan13Features.setSynchronization2(true).setDynamicRendering(true);
     deviceCreateInfo.setPEnabledFeatures(&deviceFeatures);
-    deviceCreateInfo.setPEnabledExtensionNames({vk::KHRSwapchainExtensionName});
-    deviceCreateInfo.setPNext(&sync2Features);
+    const std::array deviceExtensions{static_cast<const char*>(vk::KHRSwapchainExtensionName)};
+    deviceCreateInfo.setPEnabledExtensionNames(deviceExtensions);
+    deviceCreateInfo.setPNext(&vulkan13Features);
 
     deviceCreateInfo.setQueueCreateInfos(deviceQueueCreateInfo);
     device = physicalDevice.createDevice(deviceCreateInfo);
@@ -279,7 +343,7 @@ int main()
     const auto windowId = createWindow("Hello World", {1280, 720},
                                        WindowFlags::Visible | WindowFlags::Resizable | WindowFlags::DragAndDrop);
     initVulkanWindow(windowId);
-    startTextInput(windowId, Rect2D{.offset = {100, 100}, .extent = {2, 24}});
+    imguirwin::init(windowId);
     setWindowHitTestCallback(windowId, [windowId](const Vector2& point)
     {
         auto resizeBorderSize = 20;
@@ -349,8 +413,17 @@ int main()
     std::vector<WindowEvent> events{};
     events.resize(64);
     auto quit = false;
+    const auto autoMaximizeSeconds = std::getenv("RWIN_TEST_AUTOMAX") ? std::atof(std::getenv("RWIN_TEST_AUTOMAX")) : 0.0;
+    const auto loopStart = std::chrono::steady_clock::now();
+    auto autoMaximized = false;
     while (!quit)
     {
+        if (autoMaximizeSeconds > 0.0 && !autoMaximized &&
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - loopStart).count() > autoMaximizeSeconds)
+        {
+            maximizeWindow(windowId);
+            autoMaximized = true;
+        }
         pumpEvents();
         const auto eventsGotten = getEvents(events);
         for (auto i = 0; i < eventsGotten; i++)
@@ -358,31 +431,18 @@ int main()
             const auto& event = events[i];
             if (event.info.windowId != windowId) continue;
 
-            switch (event.info.type)
+            if (event.info.type == WindowEventType::Close)
             {
-            case WindowEventType::Close:
                 quit = true;
-                break;
-            case WindowEventType::TextCommit:
-                std::cout << "commit: " << toUtf8(getEventText(event.textCommit.text)) << std::endl;
-                break;
-            case WindowEventType::TextPreedit:
-                std::cout << "preedit: [" << toUtf8(getEventText(event.textPreedit.text)) << "] caret "
-                          << event.textPreedit.caretStart << "-" << event.textPreedit.caretEnd << std::endl;
-                break;
-            case WindowEventType::Key:
-                {
-                    if (event.key.key == InputKey::W && event.key.state == InputState::Pressed)
-                    {
-                        std::cout << "W Key Pressed" << std::endl;
-                    }
-                }
-                break;
-            default: ;
             }
+            imguirwin::handleEvent(event);
         }
         drawWindow(windowId);
     }
+    device.waitIdle();
+    ImGui_ImplVulkan_Shutdown();
+    ImGui::DestroyContext();
+    device.destroyDescriptorPool(imguiPool);
     destroyVulkanWindow(windowId);
     destroyWindow(windowId);
     destroyVulkan();
