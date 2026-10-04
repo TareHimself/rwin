@@ -6,9 +6,16 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
 
 set(RWIN_VERSION "1.0.0" CACHE STRING "rwin version")
 set(RWIN_PLATFORM_COMPAT OFF CACHE BOOL "use glfw instead of platform custom platform manager")
-project(rwin LANGUAGES C CXX OBJCXX VERSION ${RWIN_VERSION} DESCRIPTION "C++ library for management of windows")
+project(rwin LANGUAGES C CXX VERSION ${RWIN_VERSION} DESCRIPTION "C++ library for management of windows")
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
-file(GLOB_RECURSE SOURCE_FILES "${CMAKE_CURRENT_LIST_DIR}/lib/*.cpp" "${CMAKE_CURRENT_LIST_DIR}/lib/*.mm" "${CMAKE_CURRENT_LIST_DIR}/lib/*.h")
+file(GLOB_RECURSE SOURCE_FILES "${CMAKE_CURRENT_LIST_DIR}/lib/*.cpp" "${CMAKE_CURRENT_LIST_DIR}/lib/*.h")
+if(APPLE)
+    file(GLOB_RECURSE OBJCXX_SOURCE_FILES "${CMAKE_CURRENT_LIST_DIR}/lib/*.mm")
+    list(APPEND SOURCE_FILES ${OBJCXX_SOURCE_FILES})
+endif()
 
 add_library(${PROJECT_NAME} ${SOURCE_FILES}
         lib/rwin/glfw/GLFWWindowManager.cpp
@@ -83,15 +90,19 @@ else()
 
         target_sources(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_SOURCES})
         target_include_directories(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_OUTPUT_DIR})
-        target_link_libraries(${PROJECT_NAME} PRIVATE wayland::wayland-client wayland-protocols::wayland-protocols libdecor::libdecor xkbcommon::xkbcommon)
-        #    set(LIBDECOR_RESOURCES $<IF:$<CONFIG:Debug>,${libdecor_RES_DIRS_DEBUG},${libdecor_RES_DIRS_RELEASE}>)
-        set(LIBDECOR_RESOURCES $<IF:$<CONFIG:Debug>,"A","B">)
+        target_link_libraries(${PROJECT_NAME} PRIVATE wayland::wayland-client wayland::wayland-cursor wayland-protocols::wayland-protocols libdecor::libdecor xkbcommon::xkbcommon)
+        if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+            set(LIBDECOR_PACKAGE_FOLDER ${libdecor_PACKAGE_FOLDER_DEBUG})
+        else()
+            set(LIBDECOR_PACKAGE_FOLDER ${libdecor_PACKAGE_FOLDER_RELEASE})
+        endif()
+        set(LIBDECOR_PLUGINS_DIR ${LIBDECOR_PACKAGE_FOLDER}/lib/libdecor/plugins-1)
         set_property(TARGET rwin PROPERTY RESOURCE_DIRS
-                $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/share/libdecor/plugins-1>$<BUILD_INTERFACE:$<IF:$<CONFIG:Debug>,${libdecor_RES_DIRS_DEBUG},${libdecor_RES_DIRS_RELEASE}>>
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/share/libdecor/plugins-1>$<BUILD_INTERFACE:${LIBDECOR_PLUGINS_DIR}>
         )
         install(
-                DIRECTORY LIBDECOR_RESOURCES
-                DESTINATION ${CMAKE_INSTALL_PREFIX}/share/libdecor
+                DIRECTORY ${LIBDECOR_PLUGINS_DIR}/
+                DESTINATION share/libdecor/plugins-1
         )
 
     endif()
