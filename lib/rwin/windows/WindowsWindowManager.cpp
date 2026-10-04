@@ -9,6 +9,7 @@
 #define NTDDI_VERSION 0x0A000000
 #endif
 
+#include "../ScrollUnits.h"
 #include "WindowsWindowManager.h"
 #include <windows.h>
 #include <shlobj.h>
@@ -16,18 +17,24 @@
 #include <stringapiset.h>
 #include <dwmapi.h>
 #include <windowsx.h>
+#include <imm.h>
+#include <algorithm>
+#include <string>
+#include <vector>
 #include <vulkan/vulkan_win32.h>
 #include <atlbase.h>
 #include <atlcom.h>
 
 #include "rwin/IDropContext.h"
 #pragma comment (lib, "Dwmapi")
+#pragma comment (lib, "imm32")
 namespace rwin
 {
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static HINSTANCE INSTANCE;
-    const LPCSTR DEFAULT_WINDOW_CLASS_NAME = "Default Window Class";
+    const LPCWSTR DEFAULT_WINDOW_CLASS_NAME = L"Default Window Class";
     WindowsWindowManager* MANAGER_INSTANCE = nullptr;
+    constexpr int KEY_DOWN_MASK = 0x8000;
 
 
     struct DropContext : IDropContext
@@ -48,10 +55,11 @@ namespace rwin
 
             if (SUCCEEDED(_dataObject->GetData(&formatEtc, &stgMedium)))
             {
+                bool success = false;
                 if (const auto hDrop = static_cast<HDROP>(GlobalLock(stgMedium.hGlobal)))
                 {
                     const auto fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
-                    for (auto i = 0; i < fileCount; ++i)
+                    for (UINT i = 0; i < fileCount; ++i)
                     {
                         wchar_t filePath[MAX_PATH];
                         if (DragQueryFileW(hDrop, i, filePath, MAX_PATH))
@@ -60,11 +68,11 @@ namespace rwin
                         }
                     }
                     GlobalUnlock(stgMedium.hGlobal);
-
-                    return true;
+                    success = true;
                 }
 
                 ReleaseStgMedium(&stgMedium);
+                return success;
             }
 
             return false;
@@ -384,10 +392,59 @@ namespace rwin
         }
     }
 
+    void ApplyCandidateRect(HWND hwnd, const Rect2D& caret)
+    {
+        const auto himc = ImmGetContext(hwnd);
+        if (!himc)
+        {
+            return;
+        }
+
+        const RECT area{
+            caret.offset.x,
+            caret.offset.y,
+            caret.offset.x + static_cast<LONG>(caret.extent.width),
+            caret.offset.y + static_cast<LONG>(caret.extent.height),
+        };
+        CANDIDATEFORM candidate{};
+        candidate.dwStyle = CFS_EXCLUDE;
+        candidate.ptCurrentPos = POINT{area.left, area.bottom};
+        candidate.rcArea = area;
+        ImmSetCandidateWindow(himc, &candidate);
+        ImmReleaseContext(hwnd, himc);
+    }
+
+    std::u16string ReadCompositionString(const HIMC himc, const DWORD index)
+    {
+        const LONG bytes = ImmGetCompositionStringW(himc, index, nullptr, 0);
+        if (bytes <= 0)
+        {
+            return {};
+        }
+        std::u16string text(static_cast<std::size_t>(bytes) / sizeof(char16_t), u'\0');
+        ImmGetCompositionStringW(himc, index, text.data(), static_cast<DWORD>(bytes));
+        return text;
+    }
+
+    void EmitPreedit(WindowInfo& info, const std::u16string_view text, const std::uint32_t caretStart,
+                     const std::uint32_t caretEnd)
+    {
+        info.preeditActive = !text.empty();
+        WindowEvent ev{};
+        new(&ev.textPreedit) TextPreeditEvent{
+            .type = WindowEventType::TextPreedit,
+            .windowId = info.id,
+            .text = MANAGER_INSTANCE->textArena.Append(text),
+            .caretStart = caretStart,
+            .caretEnd = caretEnd,
+        };
+        MANAGER_INSTANCE->pendingEvents.push_back(ev);
+    }
+
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     {
-        auto windowInfo = MANAGER_INSTANCE->GetWindowInfo(hwnd);
-        if (windowInfo == nullptr) return DefWindowProc(hwnd, uMsg, wParam, lParam);
+        auto windowInfo = MANAGER_INSTANCE ? MANAGER_INSTANCE->GetWindowInfo(hwnd) : nullptr;
+        if (windowInfo == nullptr) return DefWindowProcW(hwnd, uMsg, wParam, lParam);
 
         switch (uMsg)
         {
@@ -395,7 +452,7 @@ namespace rwin
         //     break;
         case WM_NCHITTEST:
             {
-                LRESULT hit = DefWindowProc(hwnd, uMsg, wParam, lParam);
+                LRESULT hit = DefWindowProcW(hwnd, uMsg, wParam, lParam);
                 if (hit == HTCLIENT && windowInfo->hitTestFunction.has_value())
                 {
                     int x = GET_X_LPARAM(lParam);
@@ -477,7 +534,7 @@ namespace rwin
                     }
                     else
                     {
-                        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+                        return DefWindowProcW(hwnd, uMsg, wParam, lParam);
                     }
                 }
 
@@ -488,6 +545,35 @@ namespace rwin
                     .type = WindowEventType::CursorMove,
                     .windowId = windowInfo->id,
                     .position = Vector2{x, y},
+                };
+                MANAGER_INSTANCE->pendingEvents.push_back(ev);
+                return 0;
+            }
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+            {
+                POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+                ScreenToClient(hwnd, &point);
+
+                const bool horizontal = uMsg == WM_MOUSEHWHEEL;
+                const UINT systemLines = horizontal ? SPI_GETWHEELSCROLLCHARS : SPI_GETWHEELSCROLLLINES;
+                UINT lines = static_cast<UINT>(SCROLL_DEFAULT_LINES_PER_NOTCH);
+                SystemParametersInfoW(systemLines, 0, &lines, 0);
+                if (lines == WHEEL_PAGESCROLL)
+                {
+                    lines = static_cast<UINT>(SCROLL_DEFAULT_LINES_PER_NOTCH);
+                }
+
+                const float dpiScale = static_cast<float>(GetDpiForWindow(hwnd)) / USER_DEFAULT_SCREEN_DPI;
+                const float notches = static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / WHEEL_DELTA;
+                const float pixels = notches * static_cast<float>(lines) * SCROLL_LINE_PIXELS * dpiScale;
+
+                WindowEvent ev{};
+                new(&ev.scroll) ScrollEvent{
+                    .type = WindowEventType::Scroll,
+                    .windowId = windowInfo->id,
+                    .position = Vector2{static_cast<float>(point.x), static_cast<float>(point.y)},
+                    .delta = Vector2{horizontal ? pixels : 0.0f, horizontal ? 0.0f : pixels},
                 };
                 MANAGER_INSTANCE->pendingEvents.push_back(ev);
                 return 0;
@@ -541,12 +627,28 @@ namespace rwin
                     break; // fallback
                 }
 
+                // Keep receiving the mouse while any button is held, so a release outside the window is seen.
+                const auto buttonBit = 1u << static_cast<unsigned>(button);
+                if (isDown)
+                {
+                    windowInfo->heldButtons |= buttonBit;
+                    SetCapture(hwnd);
+                }
+                else
+                {
+                    windowInfo->heldButtons &= ~buttonBit;
+                    if (windowInfo->heldButtons == 0)
+                    {
+                        ReleaseCapture();
+                    }
+                }
+
                 // Modifier keys
                 Flags<InputModifier> modifiers{};
-                if (GetKeyState(VK_SHIFT) & KF_UP) modifiers.Add(InputModifier::Shift);
-                if (GetKeyState(VK_CONTROL) & KF_UP) modifiers.Add(InputModifier::Control);
-                if (GetKeyState(VK_MENU) & KF_UP) modifiers.Add(InputModifier::Alt);
-                if ((GetKeyState(VK_LWIN) & KF_UP) || (GetKeyState(VK_RWIN) & KF_UP))
+                if (GetKeyState(VK_SHIFT) & KEY_DOWN_MASK) modifiers.Add(InputModifier::Shift);
+                if (GetKeyState(VK_CONTROL) & KEY_DOWN_MASK) modifiers.Add(InputModifier::Control);
+                if (GetKeyState(VK_MENU) & KEY_DOWN_MASK) modifiers.Add(InputModifier::Alt);
+                if ((GetKeyState(VK_LWIN) & KEY_DOWN_MASK) || (GetKeyState(VK_RWIN) & KEY_DOWN_MASK))
                     modifiers.Add(InputModifier::Super);
                 if (GetKeyState(VK_CAPITAL) & 0x0001) modifiers.Add(InputModifier::CapsLock);
                 if (GetKeyState(VK_NUMLOCK) & 0x0001) modifiers.Add(InputModifier::NumLock);
@@ -559,6 +661,137 @@ namespace rwin
                     .modifier = static_cast<InputModifier>(modifiers),
                 };
                 MANAGER_INSTANCE->pendingEvents.push_back(ev);
+                return 0;
+            }
+        case WM_CANCELMODE:
+            {
+                if (GetCapture() == hwnd)
+                {
+                    ReleaseCapture();
+                }
+                break;
+            }
+        case WM_CAPTURECHANGED:
+            {
+                if (reinterpret_cast<HWND>(lParam) == hwnd)
+                {
+                    break;
+                }
+
+                // Capture was taken away, so the releases will never arrive; report them now.
+                for (unsigned bit = 0; windowInfo->heldButtons != 0; ++bit)
+                {
+                    if ((windowInfo->heldButtons & (1u << bit)) == 0)
+                    {
+                        continue;
+                    }
+                    windowInfo->heldButtons &= ~(1u << bit);
+
+                    WindowEvent ev{};
+                    new(&ev.cursorButton) CursorButtonEvent{
+                        .type = WindowEventType::CursorButton,
+                        .windowId = windowInfo->id,
+                        .button = static_cast<CursorButton>(bit),
+                        .state = InputState::Released,
+                        .modifier = static_cast<InputModifier>(0),
+                    };
+                    MANAGER_INSTANCE->pendingEvents.push_back(ev);
+                }
+                break;
+            }
+        case WM_IME_SETCONTEXT:
+            {
+                if (windowInfo->textInputActive)
+                {
+                    lParam &= ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW);
+                }
+                return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+            }
+        case WM_IME_STARTCOMPOSITION:
+            {
+                if (!windowInfo->textInputActive)
+                {
+                    break;
+                }
+                ApplyCandidateRect(hwnd, windowInfo->textInputRect);
+                return 0;
+            }
+        case WM_IME_COMPOSITION:
+            {
+                if (!windowInfo->textInputActive)
+                {
+                    break;
+                }
+
+                const auto himc = ImmGetContext(hwnd);
+                if (!himc)
+                {
+                    break;
+                }
+
+                if (lParam & GCS_RESULTSTR)
+                {
+                    const auto result = ReadCompositionString(himc, GCS_RESULTSTR);
+                    if (!result.empty())
+                    {
+                        WindowEvent ev{};
+                        new(&ev.textCommit) TextCommitEvent{
+                            .type = WindowEventType::TextCommit,
+                            .windowId = windowInfo->id,
+                            .text = MANAGER_INSTANCE->textArena.Append(result),
+                        };
+                        MANAGER_INSTANCE->pendingEvents.push_back(ev);
+                    }
+                }
+
+                if (lParam & GCS_COMPSTR)
+                {
+                    const auto preedit = ReadCompositionString(himc, GCS_COMPSTR);
+                    const auto length = static_cast<std::uint32_t>(preedit.size());
+                    auto caretStart = length;
+                    auto caretEnd = length;
+
+                    if (lParam & GCS_CURSORPOS)
+                    {
+                        caretStart = caretEnd = (std::min)(
+                            static_cast<std::uint32_t>(LOWORD(ImmGetCompositionStringW(himc, GCS_CURSORPOS, nullptr, 0))),
+                            length);
+                    }
+
+                    // The clause being converted is reported as the selected range.
+                    std::vector<BYTE> attributes(length);
+                    if ((lParam & GCS_COMPATTR) && length > 0 &&
+                        ImmGetCompositionStringW(himc, GCS_COMPATTR, attributes.data(), length) == static_cast<LONG>(length))
+                    {
+                        const auto isTarget = [](const BYTE attribute)
+                        {
+                            return attribute == ATTR_TARGET_CONVERTED || attribute == ATTR_TARGET_NOTCONVERTED;
+                        };
+                        const auto first = std::find_if(attributes.begin(), attributes.end(), isTarget);
+                        if (first != attributes.end())
+                        {
+                            const auto last = std::find_if_not(first, attributes.end(), isTarget);
+                            caretStart = static_cast<std::uint32_t>(first - attributes.begin());
+                            caretEnd = static_cast<std::uint32_t>(last - attributes.begin());
+                        }
+                    }
+
+                    EmitPreedit(*windowInfo, preedit, caretStart, caretEnd);
+                }
+
+                ImmReleaseContext(hwnd, himc);
+                return 0;
+            }
+        case WM_IME_ENDCOMPOSITION:
+            {
+                if (!windowInfo->textInputActive)
+                {
+                    break;
+                }
+                if (windowInfo->preeditActive)
+                {
+                    EmitPreedit(*windowInfo, {}, 0, 0);
+                }
                 return 0;
             }
         case WM_CHAR:
@@ -603,7 +836,17 @@ namespace rwin
             }
         case WM_KEYDOWN:
         case WM_KEYUP:
+        case WM_SYSKEYDOWN:
+        case WM_SYSKEYUP:
             {
+                const bool isSystemKey = uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP;
+                const bool isKeyUp = uMsg == WM_KEYUP || uMsg == WM_SYSKEYUP;
+
+                if (windowInfo->textInputActive && wParam == VK_PROCESSKEY)
+                {
+                    return 0;
+                }
+
                 WindowEvent evt{};
 
                 // Fill basic event info
@@ -614,15 +857,15 @@ namespace rwin
                 auto keyFlags = HIWORD(lParam);
                 // State (pressed / released / repeat)
                 bool isRepeat = (keyFlags & KF_REPEAT) == KF_REPEAT;
-                const auto state = (uMsg == WM_KEYUP)
+                const auto state = isKeyUp
                                        ? InputState::Released
                                        : (isRepeat ? InputState::Repeat : InputState::Pressed);
                 // Modifier bitmask
                 Flags<InputModifier> modifiers{};
-                if (GetKeyState(VK_SHIFT) & KF_UP) modifiers.Add(InputModifier::Shift);
-                if (GetKeyState(VK_CONTROL) & KF_UP) modifiers.Add(InputModifier::Control);
-                if (GetKeyState(VK_MENU) & KF_UP) modifiers.Add(InputModifier::Alt);
-                if (GetKeyState(VK_LWIN) & KF_UP || GetKeyState(VK_RWIN) & KF_UP)
+                if (GetKeyState(VK_SHIFT) & KEY_DOWN_MASK) modifiers.Add(InputModifier::Shift);
+                if (GetKeyState(VK_CONTROL) & KEY_DOWN_MASK) modifiers.Add(InputModifier::Control);
+                if (GetKeyState(VK_MENU) & KEY_DOWN_MASK) modifiers.Add(InputModifier::Alt);
+                if (GetKeyState(VK_LWIN) & KEY_DOWN_MASK || GetKeyState(VK_RWIN) & KEY_DOWN_MASK)
                     modifiers.Add(InputModifier::Super);
                 if (GetKeyState(VK_CAPITAL) & 0x0001) modifiers.Add(InputModifier::CapsLock);
                 if (GetKeyState(VK_NUMLOCK) & 0x0001) modifiers.Add(InputModifier::NumLock);
@@ -638,12 +881,56 @@ namespace rwin
                     .modifier = static_cast<InputModifier>(modifiers),
                 };
                 MANAGER_INSTANCE->pendingEvents.push_back(ev);
-                // Now dispatch or store evt...
-                // Example: processEvent(evt);
+                // Alt+F4 only closes the window if the default handler sees it.
+                if (isSystemKey && wParam == VK_F4)
+                {
+                    return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+                }
                 return 0;
             }
+        case WM_DPICHANGED:
+            {
+                const auto suggested = reinterpret_cast<const RECT*>(lParam);
+                SetWindowPos(hwnd, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
+                             suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                return 0;
+            }
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+            {
+                WindowEvent ev{};
+                new(&ev.keyboardFocus) FocusEvent{
+                    .type = WindowEventType::KeyboardFocus,
+                    .windowId = windowInfo->id,
+                    .focused = uMsg == WM_SETFOCUS ? 1 : 0,
+                };
+                MANAGER_INSTANCE->pendingEvents.push_back(ev);
+            }
+            break;
         case WM_SIZE:
             {
+                if (wParam == SIZE_MINIMIZED)
+                {
+                    WindowEvent minimizeEv{};
+                    new(&minimizeEv.minimize) MinimizeEvent{
+                        .type = WindowEventType::Minimize,
+                        .windowId = windowInfo->id,
+                    };
+                    MANAGER_INSTANCE->pendingEvents.push_back(minimizeEv);
+                    break;
+                }
+
+                if (wParam == SIZE_MAXIMIZED && !windowInfo->maximized)
+                {
+                    WindowEvent maximizeEv{};
+                    new(&maximizeEv.maximize) MaximizeEvent{
+                        .type = WindowEventType::Maximize,
+                        .windowId = windowInfo->id,
+                    };
+                    MANAGER_INSTANCE->pendingEvents.push_back(maximizeEv);
+                }
+                windowInfo->maximized = wParam == SIZE_MAXIMIZED;
+
                 WindowEvent ev{};
                 new(&ev.resize) ResizeEvent{
                     .type = WindowEventType::Resize,
@@ -674,29 +961,43 @@ namespace rwin
             break;
         }
 
-        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+        return DefWindowProcW(hwnd, uMsg, wParam, lParam);
     }
 
 
     WindowsWindowManager::WindowsWindowManager()
     {
         OleInitialize(nullptr);
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         INSTANCE = GetModuleHandle(nullptr);
         {
-            WNDCLASS wc = {
+            WNDCLASSW wc = {
                 .lpfnWndProc = WindowProc,
                 .hInstance = INSTANCE,
                 .lpszClassName = DEFAULT_WINDOW_CLASS_NAME
             };
 
-            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-            RegisterClass(&wc);
+            wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+            RegisterClassW(&wc);
         }
         MANAGER_INSTANCE = this;
     }
 
     WindowsWindowManager::~WindowsWindowManager()
     {
+        std::vector<std::uint64_t> ids;
+        ids.reserve(_windows.size());
+        for (const auto& window : _windows)
+        {
+            ids.push_back(window.first);
+        }
+        for (const auto id : ids)
+        {
+            Destroy(id);
+        }
+
+        UnregisterClassW(DEFAULT_WINDOW_CLASS_NAME, INSTANCE);
+        MANAGER_INSTANCE = nullptr;
         OleUninitialize();
     }
 
@@ -757,19 +1058,31 @@ namespace rwin
             windowFlags |= WS_OVERLAPPED | WS_CAPTION | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
         }
 
+        RECT frame{0, 0, static_cast<LONG>(size.width), static_cast<LONG>(size.height)};
+        AdjustWindowRectExForDpi(&frame, windowFlags, FALSE, 0, GetDpiForSystem());
+        const auto outerWidth = frame.right - frame.left;
+        const auto outerHeight = frame.bottom - frame.top;
+
         const auto screenWidth = GetSystemMetrics(SM_CXSCREEN);
         const auto screenHeight = GetSystemMetrics(SM_CYSCREEN);
-        const auto x = (screenWidth - size.width) / 2;
-        const auto y = (screenHeight - size.height) / 2;
-        const auto hwnd = CreateWindowEx(
+        const auto x = (screenWidth - outerWidth) / 2;
+        const auto y = (screenHeight - outerHeight) / 2;
+        const auto titleLength = MultiByteToWideChar(CP_UTF8, 0, title.data(), static_cast<int>(title.size()), nullptr, 0);
+        std::wstring wideTitle(static_cast<std::size_t>((std::max)(titleLength, 0)), L'\0');
+        if (titleLength > 0)
+        {
+            MultiByteToWideChar(CP_UTF8, 0, title.data(), static_cast<int>(title.size()), wideTitle.data(), titleLength);
+        }
+
+        const auto hwnd = CreateWindowExW(
             0,
             DEFAULT_WINDOW_CLASS_NAME,
-            title.data(),
+            wideTitle.c_str(),
             windowFlags,
             x,
             y,
-            size.width,
-            size.height,
+            outerWidth,
+            outerHeight,
             nullptr,
             nullptr,
             INSTANCE,
@@ -785,6 +1098,8 @@ namespace rwin
             DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
         }
 
+        ImmAssociateContext(hwnd, nullptr);
+
         ShowWindow(hwnd, flags.Has(WindowFlags::Visible) ? SW_SHOW : SW_HIDE);
 
         IDropTarget * dropTarget = nullptr;
@@ -794,14 +1109,15 @@ namespace rwin
             RegisterDragDrop(hwnd, dropTarget);
         }
 
-        _windows.emplace(windowId, WindowInfo{windowId, hwnd, false,dropTarget});
+        _windows.emplace(windowId, WindowInfo{.id = windowId, .hwnd = hwnd, .dropTarget = dropTarget});
         _hwndToWindowId.emplace(hwnd, windowId);
         return windowId;
     }
 
 
-    void WindowsWindowManager::Destroy(const std::uint64_t& id)
+    void WindowsWindowManager::Destroy(const std::uint64_t& requestedId)
     {
+        const auto id = requestedId;
         if (const auto info = _windows.find(id); info != _windows.end())
         {
             const auto hwnd = info->second.hwnd;
@@ -814,6 +1130,7 @@ namespace rwin
             DestroyWindow(hwnd);
             _hwndToWindowId.erase(hwnd);
             _windows.erase(info);
+            std::erase_if(pendingEvents, [&id](const WindowEvent& event) { return event.info.windowId == id; });
         }
     }
 
@@ -841,13 +1158,13 @@ namespace rwin
     {
         if (const auto info = GetWindowInfo(id))
         {
-            RECT rect;
+            POINT origin{0, 0};
 
-            if (GetClientRect(info->hwnd, &rect))
+            if (ClientToScreen(info->hwnd, &origin))
             {
                 return Point2D{
-                    .x = static_cast<int>(rect.left),
-                    .y = static_cast<int>(rect.top)
+                    .x = static_cast<int>(origin.x),
+                    .y = static_cast<int>(origin.y)
                 };
             }
         }
@@ -904,20 +1221,21 @@ namespace rwin
         }
 
         MSG msg;
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE) > 0)
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE) > 0)
         {
             TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            DispatchMessageW(&msg);
         }
     }
 
-    // TODO(windows): composition is system-drawn at the default position. Wire the caret rect through
-    // ImmSetCompositionWindow/ImmSetCandidateWindow so the IME popup follows the text cursor.
-    void WindowsWindowManager::StartTextInput(const std::uint64_t& id, const Rect2D&)
+    void WindowsWindowManager::StartTextInput(const std::uint64_t& id, const Rect2D& caret)
     {
         if (const auto info = GetWindowInfo(id))
         {
             info->textInputActive = true;
+            info->textInputRect = caret;
+            ImmAssociateContextEx(info->hwnd, nullptr, IACE_DEFAULT);
+            ApplyCandidateRect(info->hwnd, caret);
         }
     }
 
@@ -925,8 +1243,28 @@ namespace rwin
     {
         if (const auto info = GetWindowInfo(id))
         {
+            if (const auto himc = ImmGetContext(info->hwnd))
+            {
+                ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+                ImmReleaseContext(info->hwnd, himc);
+            }
+            ImmAssociateContext(info->hwnd, nullptr);
+
             info->textInputActive = false;
+            info->preeditActive = false;
             info->pendingHighSurrogate = 0;
+        }
+    }
+
+    void WindowsWindowManager::SetTextInputRect(const std::uint64_t& id, const Rect2D& caret)
+    {
+        if (const auto info = GetWindowInfo(id))
+        {
+            info->textInputRect = caret;
+            if (info->textInputActive)
+            {
+                ApplyCandidateRect(info->hwnd, caret);
+            }
         }
     }
 

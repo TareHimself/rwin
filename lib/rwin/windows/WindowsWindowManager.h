@@ -20,6 +20,10 @@ namespace rwin
         HWND hwnd{nullptr};
         bool trackingMouse{false};
         bool textInputActive{false};
+        bool preeditActive{false};
+        bool maximized{false};
+        std::uint32_t heldButtons{0};
+        Rect2D textInputRect{};
         char16_t pendingHighSurrogate{0}; // first half of a pair, waiting for its WM_CHAR partner
         IDropTarget* dropTarget{nullptr};
         std::optional<DropCallbacks> dropCallbacks{};
@@ -56,6 +60,7 @@ namespace rwin
         void ClearDropCallbacks(const std::uint64_t& id) override;
         void StartTextInput(const std::uint64_t& id, const Rect2D& caret) override;
         void StopTextInput(const std::uint64_t& id) override;
+        void SetTextInputRect(const std::uint64_t& id, const Rect2D& caret) override;
         std::u16string_view GetEventText(const TextRef& ref) override;
         TextArena textArena{};
 
