@@ -6,3 +6,4 @@ vcpkg_installed
 /conan
 .DS_Store
 .venv/
+.silo/
