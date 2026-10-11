@@ -1,6 +1,7 @@
 #include "../macros_private.h"
 
 #ifdef RWIN_PLATFORM_COMPAT
+#include "../ScrollUnits.h"
 #include "GLFWWindowManager.h"
 
 #include <deque>
@@ -356,6 +357,21 @@ namespace rwin {
                 double y{};
                 glfwGetCursorPos(glfwWindow, &x, &y);
 
+                int windowW{};
+                int windowH{};
+                int fbW{};
+                int fbH{};
+                glfwGetWindowSize(glfwWindow, &windowW, &windowH);
+                glfwGetFramebufferSize(glfwWindow, &fbW, &fbH);
+                if (windowW > 0 && windowH > 0) {
+                    x *= static_cast<double>(fbW) / windowW;
+                    y *= static_cast<double>(fbH) / windowH;
+                }
+
+                float xScale{1.0f};
+                float yScale{1.0f};
+                glfwGetWindowContentScale(glfwWindow, &xScale, &yScale);
+
                 WindowEvent event{};
                 new (&event.scroll) ScrollEvent{
                     .type = WindowEventType::Scroll,
@@ -365,8 +381,8 @@ namespace rwin {
                         .y = static_cast<float>(y),
                     },
                     .delta = Vector2{
-                        .x = static_cast<float>(xOffset),
-                        .y = static_cast<float>(yOffset),
+                        .x = static_cast<float>(xOffset) * SCROLL_DEFAULT_LINES_PER_NOTCH * SCROLL_LINE_PIXELS * xScale,
+                        .y = static_cast<float>(yOffset) * SCROLL_DEFAULT_LINES_PER_NOTCH * SCROLL_LINE_PIXELS * yScale,
                     },
                 };
                 info->events->push_back(event);

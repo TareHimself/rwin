@@ -1,9 +1,13 @@
 ﻿#include "../macros_private.h"
 #if defined(RWIN_PLATFORM_LINUX) && defined(RWIN_PLATFORM_LINUX_WAYLAND)
 #include "WaylandWindowManager.h"
+#include "../ScrollUnits.h"
 
+#include <algorithm>
 #include <iostream>
+#include <poll.h>
 #include <ranges>
+#include <stdexcept>
 #include <unistd.h>
 #include <wayland-client-protocol.h>
 #include <xdg-shell-client-protocol.h>
@@ -154,8 +158,58 @@ namespace rwin
         case XKB_KEY_Menu: return InputKey::Menu;
 
         default:
-            std::cerr << "Unknown keysym: " << key << std::endl;
             return InputKey::Unknown;
+        }
+    }
+
+    namespace
+    {
+        std::u16string utf8ToUtf16(const std::string_view text)
+        {
+            std::u16string out;
+            for (std::size_t i = 0; i < text.size();)
+            {
+                const auto lead = static_cast<unsigned char>(text[i]);
+                std::size_t length = 1;
+                char32_t cp = lead;
+                if (lead >= 0xF0)
+                {
+                    length = 4;
+                    cp = lead & 0x07;
+                }
+                else if (lead >= 0xE0)
+                {
+                    length = 3;
+                    cp = lead & 0x0F;
+                }
+                else if (lead >= 0xC0)
+                {
+                    length = 2;
+                    cp = lead & 0x1F;
+                }
+
+                if (i + length > text.size())
+                {
+                    break;
+                }
+                for (std::size_t j = 1; j < length; ++j)
+                {
+                    cp = (cp << 6) | (static_cast<unsigned char>(text[i + j]) & 0x3F);
+                }
+                i += length;
+
+                if (cp >= 0x10000)
+                {
+                    cp -= 0x10000;
+                    out += static_cast<char16_t>(0xD800 + (cp >> 10));
+                    out += static_cast<char16_t>(0xDC00 + (cp & 0x3FF));
+                }
+                else
+                {
+                    out += static_cast<char16_t>(cp);
+                }
+            }
+            return out;
         }
     }
 
@@ -183,13 +237,13 @@ namespace rwin
         keymap = xkb_keymap_new_from_string(
             context, keymapString, format,
             XKB_KEYMAP_COMPILE_NO_FLAGS);
-        state = xkb_state_new(keymap);
+        state = keymap ? xkb_state_new(keymap) : nullptr;
     }
 
     KeyboardInfo::~KeyboardInfo()
     {
-        xkb_state_unref(state);
-        xkb_keymap_unref(keymap);
+        if (state) xkb_state_unref(state);
+        if (keymap) xkb_keymap_unref(keymap);
     }
 
     WaylandWindowManager::WaylandWindowManager()
@@ -201,21 +255,24 @@ namespace rwin
                          int32_t fd,
                          uint32_t size)
             {
-                if (auto self = static_cast<WaylandWindowManager*>(data))
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                self->_keyboards.erase(wl_keyboard);
+
+                if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
                 {
-                    if (auto ptr = self->_keyboards.find(wl_keyboard); ptr != self->_keyboards.end())
-                    {
-                        self->_keyboards.erase(ptr);
-                    }
-
                     const auto keymapString = static_cast<char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0));
-
-                    self->_keyboards.emplace(wl_keyboard,
-                                             std::make_shared<KeyboardInfo>(
-                                                 self->_xkbContext, keymapString, XKB_KEYMAP_FORMAT_TEXT_V1));
-                    munmap(keymapString, size);
-                    close(fd);
+                    if (keymapString != MAP_FAILED)
+                    {
+                        const auto keyboard = std::make_shared<KeyboardInfo>(
+                            self->_xkbContext, keymapString, XKB_KEYMAP_FORMAT_TEXT_V1);
+                        munmap(keymapString, size);
+                        if (keyboard->state)
+                        {
+                            self->_keyboards.emplace(wl_keyboard, keyboard);
+                        }
+                    }
                 }
+                close(fd);
             },
             .enter = [](void* data,
                         struct wl_keyboard* wl_keyboard,
@@ -228,6 +285,10 @@ namespace rwin
                     if (const auto info = self->GetWindowInfo(surface))
                     {
                         self->_keyboardFocusedHandle = info->windowId;
+                        if (const auto keyboard = self->_keyboards.find(wl_keyboard); keyboard != self->_keyboards.end())
+                        {
+                            keyboard->second->keysDown.clear();
+                        }
                         WindowEvent ev{};
                         new(&ev.keyboardFocus) FocusEvent{
                             .type = WindowEventType::KeyboardFocus,
@@ -243,11 +304,16 @@ namespace rwin
                         uint32_t serial,
                         struct wl_surface* surface)
             {
-                if (auto self = static_cast<WaylandWindowManager*>(data))
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
                 {
                     if (const auto info = self->GetWindowInfo(surface))
                     {
                         self->_keyboardFocusedHandle = UINT64_NULL_HANDLE;
+                        self->_repeatKeycode = 0;
+                        if (const auto keyboard = self->_keyboards.find(wl_keyboard); keyboard != self->_keyboards.end())
+                        {
+                            keyboard->second->keysDown.clear();
+                        }
                         WindowEvent ev{};
                         new(&ev.keyboardFocus) FocusEvent{
                             .type = WindowEventType::KeyboardFocus,
@@ -265,57 +331,34 @@ namespace rwin
                       uint32_t key,
                       uint32_t state)
             {
-                if (auto self = static_cast<WaylandWindowManager*>(data))
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (self->_keyboardFocusedHandle == UINT64_NULL_HANDLE) return;
+
+                const auto found = self->_keyboards.find(wl_keyboard);
+                if (found == self->_keyboards.end()) return;
+                const auto keyboard = found->second;
+
+                const auto keycode = key + 8;
+                if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
                 {
-                    if (self->_keyboardFocusedHandle == UINT64_NULL_HANDLE) return;
+                    const bool alreadyDown = !keyboard->keysDown.insert(keycode).second;
+                    self->HandleKey(*keyboard, keycode, alreadyDown ? InputState::Repeat : InputState::Pressed);
 
-                    const auto keyboardPtr = self->_keyboards.find(wl_keyboard);
-                    if (keyboardPtr == self->_keyboards.end()) return;
-
-                    const auto keyboard = keyboardPtr->second;
-
-                    InputState inputState{};
-                    xkb_key_direction direction{};
-                    if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+                    if (xkb_keymap_key_repeats(keyboard->keymap, keycode) && self->_repeatRate > 0)
                     {
-                        inputState = InputState::Pressed;
-                        direction = xkb_key_direction::XKB_KEY_DOWN;
+                        self->_repeatKeycode = keycode;
+                        self->_repeatNext = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(self->_repeatDelayMs);
                     }
-                    else if (state == WL_KEYBOARD_KEY_STATE_RELEASED)
+                }
+                else if (state == WL_KEYBOARD_KEY_STATE_RELEASED)
+                {
+                    keyboard->keysDown.erase(keycode);
+                    if (self->_repeatKeycode == keycode)
                     {
-                        inputState = InputState::Released;
-                        direction = xkb_key_direction::XKB_KEY_UP;
+                        self->_repeatKeycode = 0;
                     }
-
-                    const auto keyCode = key + 8;
-                    xkb_state_update_key(keyboard->state, keyCode, direction);
-
-                    const auto xkbKey = xkb_state_key_get_one_sym(keyboard->state, keyCode);
-                    const auto rinKey = xkbKeyToInputKey(xkbKey);
-
-                    if (keyboard->keysPressed.contains(rinKey) && inputState == InputState::Pressed)
-                    {
-                        inputState = InputState::Repeat;
-                    }
-                    const auto modifiers = getInputModifiers(keyboard->state);
-                    WindowEvent ev{};
-                    new(&ev.key) KeyEvent{
-                        .type = WindowEventType::Key,
-                        .windowId = self->_keyboardFocusedHandle,
-                        .key = rinKey,
-                        .state = inputState,
-                        .modifier = static_cast<InputModifier>(modifiers)
-                    };
-                    self->_pendingEvents.push_back(ev);
-
-                    if (keyboard->keysPressed.contains(rinKey) && inputState == InputState::Released)
-                    {
-                        keyboard->keysPressed.erase(rinKey);
-                    }
-                    else
-                    {
-                        keyboard->keysPressed.insert(rinKey);
-                    }
+                    self->HandleKey(*keyboard, keycode, InputState::Released);
                 }
             },
             .modifiers = [](void* data,
@@ -326,11 +369,10 @@ namespace rwin
                             uint32_t mods_locked,
                             uint32_t group)
             {
-                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (const auto found = self->_keyboards.find(wl_keyboard); found != self->_keyboards.end())
                 {
-                    const auto keyboard = self->_keyboards[wl_keyboard];
-
-                    xkb_state_update_mask(keyboard->state,
+                    xkb_state_update_mask(found->second->state,
                                           mods_depressed, mods_latched, mods_locked, 0, 0, group);
                 }
             },
@@ -339,6 +381,9 @@ namespace rwin
                               int32_t rate,
                               int32_t delay)
             {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                self->_repeatRate = rate;
+                self->_repeatDelayMs = delay;
             },
         };
 
@@ -355,6 +400,12 @@ namespace rwin
                     if (const auto info = self->GetWindowInfo(surface))
                     {
                         self->_cursorFocusedHandle = info->windowId;
+                        info->cursorPosition = {
+                            static_cast<float>(wl_fixed_to_double(surface_x)) * static_cast<float>(info->scale),
+                            static_cast<float>(wl_fixed_to_double(surface_y)) * static_cast<float>(info->scale),
+                        };
+                        self->ApplyCursor(serial, info->scale);
+
                         WindowEvent ev{};
                         new(&ev.cursorFocus) FocusEvent{
                             .type = WindowEventType::CursorFocus,
@@ -362,6 +413,14 @@ namespace rwin
                             .focused = 1,
                         };
                         self->_pendingEvents.push_back(ev);
+
+                        WindowEvent moveEv{};
+                        new(&moveEv.cursorMove) CursorMoveEvent{
+                            .type = WindowEventType::CursorMove,
+                            .windowId = info->windowId,
+                            .position = info->cursorPosition,
+                        };
+                        self->_pendingEvents.push_back(moveEv);
                     }
                 }
             },
@@ -395,8 +454,8 @@ namespace rwin
                 {
                     if (const auto info = self->GetWindowInfo(self->_cursorFocusedHandle))
                     {
-                        const auto x = static_cast<float>(wl_fixed_to_double(surface_x));
-                        const auto y = static_cast<float>(wl_fixed_to_double(surface_y));
+                        const auto x = static_cast<float>(wl_fixed_to_double(surface_x)) * static_cast<float>(info->scale);
+                        const auto y = static_cast<float>(wl_fixed_to_double(surface_y)) * static_cast<float>(info->scale);
                         WindowEvent ev{};
                         info->cursorPosition = {x, y};
 
@@ -449,7 +508,7 @@ namespace rwin
                             .windowId = info->windowId,
                             .button = btn,
                             .state = btnState,
-                            .modifier = static_cast<InputModifier>(0),
+                            .modifier = static_cast<InputModifier>(self->CurrentModifiers()),
                         };
                         self->_pendingEvents.push_back(ev);
                     }
@@ -461,10 +520,31 @@ namespace rwin
                        uint32_t axis,
                        wl_fixed_t value)
             {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    const auto amount = static_cast<float>(wl_fixed_to_double(value));
+                    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL)
+                    {
+                        self->_scrollContinuous.x += amount;
+                    }
+                    else
+                    {
+                        self->_scrollContinuous.y += amount;
+                    }
+
+                    if (!self->_pointerHasFrame)
+                    {
+                        self->FlushScroll();
+                    }
+                }
             },
             .frame = [](void* data,
                         struct wl_pointer* wl_pointer)
             {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    self->FlushScroll();
+                }
             },
             .axis_source = [](void* data,
                               struct wl_pointer* wl_pointer,
@@ -482,12 +562,30 @@ namespace rwin
                                 uint32_t axis,
                                 int32_t discrete)
             {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    if (wl_pointer_get_version(wl_pointer) >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION)
+                    {
+                        return;
+                    }
+                    auto& target = axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL
+                                       ? self->_scrollDiscrete120.x
+                                       : self->_scrollDiscrete120.y;
+                    target += static_cast<float>(discrete) * 120.0f;
+                }
             },
             .axis_value120 = [](void* data,
                                 struct wl_pointer* wl_pointer,
                                 uint32_t axis,
                                 int32_t value120)
             {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    auto& target = axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL
+                                       ? self->_scrollDiscrete120.x
+                                       : self->_scrollDiscrete120.y;
+                    target += static_cast<float>(value120);
+                }
             },
             .axis_relative_direction = [](void* data,
                                           struct wl_pointer* wl_pointer,
@@ -503,16 +601,34 @@ namespace rwin
                                uint32_t capabilities)
             {
                 auto self = static_cast<WaylandWindowManager*>(data);
-                if ((capabilities & WL_SEAT_CAPABILITY_KEYBOARD) > 0)
+
+                const bool hasKeyboard = (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) != 0;
+                if (hasKeyboard && !self->_keyboard)
                 {
                     self->_keyboard = wl_seat_get_keyboard(self->_seat);
                     wl_keyboard_add_listener(self->_keyboard, &self->_keyboardListener, self);
                 }
+                else if (!hasKeyboard && self->_keyboard)
+                {
+                    self->_keyboards.erase(self->_keyboard);
+                    wl_keyboard_release(self->_keyboard);
+                    self->_keyboard = nullptr;
+                    self->_keyboardFocusedHandle = UINT64_NULL_HANDLE;
+                    self->_repeatKeycode = 0;
+                }
 
-                if ((capabilities & WL_SEAT_CAPABILITY_POINTER) > 0)
+                const bool hasPointer = (capabilities & WL_SEAT_CAPABILITY_POINTER) != 0;
+                if (hasPointer && !self->_pointer)
                 {
                     self->_pointer = wl_seat_get_pointer(self->_seat);
+                    self->_pointerHasFrame = wl_pointer_get_version(self->_pointer) >= WL_POINTER_FRAME_SINCE_VERSION;
                     wl_pointer_add_listener(self->_pointer, &self->_pointerListener, self);
+                }
+                else if (!hasPointer && self->_pointer)
+                {
+                    wl_pointer_release(self->_pointer);
+                    self->_pointer = nullptr;
+                    self->_cursorFocusedHandle = UINT64_NULL_HANDLE;
                 }
             },
             .name = [](void* data,
@@ -536,18 +652,109 @@ namespace rwin
 
                 if (interfaceName == wl_compositor_interface.name)
                 {
-                    const auto bindVersion = std::min<uint32_t>(version, wl_seat_interface.version);
+                    const auto bindVersion = std::min<uint32_t>(version, wl_compositor_interface.version);
                     self->_compositor = static_cast<wl_compositor*>(wl_registry_bind(
                         registry, name, &wl_compositor_interface,
                         bindVersion));
+                    self->_hasPreferredBufferScale = bindVersion >= WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION;
+                }
+                else if (interfaceName == wl_output_interface.name)
+                {
+                    const auto bindVersion = std::min<uint32_t>(version, 3);
+                    const auto output = static_cast<wl_output*>(wl_registry_bind(
+                        registry, name, &wl_output_interface, bindVersion));
+                    self->_outputScales[output] = 1;
+                    wl_output_add_listener(output, &self->_outputListener, self);
+                }
+                else if (interfaceName == wl_shm_interface.name)
+                {
+                    self->_shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
                 }
                 else if (interfaceName == wl_seat_interface.name)
                 {
                     const auto bindVersion = std::min<uint32_t>(version, wl_seat_interface.version);
                     self->_seat = static_cast<wl_seat*>(wl_registry_bind(
                         registry, name, &wl_seat_interface, bindVersion));
-                    //wl_seat_add_listener(self->_seat, &seatListener, nullptr);
+                    wl_seat_add_listener(self->_seat, &self->_seatListener, self);
                 }
+            },
+            .global_remove = [](void* data,
+                                struct wl_registry* registry,
+                                uint32_t name)
+            {
+            },
+        };
+
+        _outputListener = {
+            .geometry = [](void* data, struct wl_output* output, int32_t x, int32_t y, int32_t physicalWidth,
+                           int32_t physicalHeight, int32_t subpixel, const char* make, const char* model,
+                           int32_t transform)
+            {
+            },
+            .mode = [](void* data, struct wl_output* output, uint32_t flags, int32_t width, int32_t height,
+                       int32_t refresh)
+            {
+            },
+            .done = [](void* data, struct wl_output* output)
+            {
+            },
+            .scale = [](void* data, struct wl_output* output, int32_t factor)
+            {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    self->_outputScales[output] = std::max(factor, 1);
+                    for (const auto& window : self->_windows)
+                    {
+                        if (window.second->outputs.contains(output))
+                        {
+                            self->UpdateScaleFromOutputs(window.second.get());
+                        }
+                    }
+                }
+            },
+            .name = [](void* data, struct wl_output* output, const char* name)
+            {
+            },
+            .description = [](void* data, struct wl_output* output, const char* description)
+            {
+            },
+        };
+
+        _surfaceListener = {
+            .enter = [](void* data, struct wl_surface* surface, struct wl_output* output)
+            {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    if (const auto info = self->GetWindowInfo(surface))
+                    {
+                        info->outputs.insert(output);
+                        self->UpdateScaleFromOutputs(info);
+                    }
+                }
+            },
+            .leave = [](void* data, struct wl_surface* surface, struct wl_output* output)
+            {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    if (const auto info = self->GetWindowInfo(surface))
+                    {
+                        info->outputs.erase(output);
+                        self->UpdateScaleFromOutputs(info);
+                    }
+                }
+            },
+            .preferred_buffer_scale = [](void* data, struct wl_surface* surface, int32_t factor)
+            {
+                if (const auto self = static_cast<WaylandWindowManager*>(data))
+                {
+                    if (const auto info = self->GetWindowInfo(surface))
+                    {
+                        self->ApplyScale(info, factor);
+                    }
+                }
+            },
+            .preferred_buffer_transform = [](void* data, struct wl_surface* surface, uint32_t transform)
+            {
             },
         };
 
@@ -567,6 +774,22 @@ namespace rwin
 
                     auto newExtent = Extent2D{static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
 
+                    libdecor_window_state windowState{};
+                    if (libdecor_configuration_get_window_state(configuration, &windowState))
+                    {
+                        const bool maximized = (windowState & LIBDECOR_WINDOW_STATE_MAXIMIZED) != 0;
+                        if (maximized && !info->maximized)
+                        {
+                            WindowEvent maximizeEv{};
+                            new(&maximizeEv.maximize) MaximizeEvent{
+                                .type = WindowEventType::Maximize,
+                                .windowId = info->windowId,
+                            };
+                            info->windowManager->_pendingEvents.push_back(maximizeEv);
+                        }
+                        info->maximized = maximized;
+                    }
+
                     auto state = libdecor_state_new(width, height);
                     libdecor_frame_commit(frame, state, configuration);
                     libdecor_state_free(state);
@@ -578,7 +801,7 @@ namespace rwin
                         new(&ev.resize) ResizeEvent{
                             .type = WindowEventType::Resize,
                             .windowId = info->windowId,
-                            .size = info->size,
+                            .size = info->windowManager->GetPhysicalSize(info),
                         };
                         info->windowManager->_pendingEvents.push_back(ev);
                     }
@@ -616,30 +839,50 @@ namespace rwin
             }
         };
 
-        _displayListener = {
-            .error = [](void *data,
-                        struct wl_display *wl_display,
-                        void *object_id,
-                        uint32_t code,
-                        const char *message) {
-                std::cerr << "Display listener error: " << message << std::endl;
-            }
-        };
-
         _xkbContext = xkb_context_new(static_cast<xkb_context_flags>(0));
         _display = wl_display_connect(nullptr);
-        //wl_display_add_listener(_display,&_displayListener,nullptr); // errors out with display already has a listener ?
+        if (!_display)
+        {
+            throw std::runtime_error("rwin: could not connect to the Wayland display");
+        }
         _registry = wl_display_get_registry(_display);
         wl_registry_add_listener(_registry, &_registryListener, this);
         wl_display_roundtrip(_display);
+        wl_display_roundtrip(_display);
+        if (!_compositor)
+        {
+            throw std::runtime_error("rwin: the Wayland compositor does not provide wl_compositor");
+        }
         _decorContext = libdecor_new(_display, &_decorInterface);
+
+        if (_shm)
+        {
+            _cursorSurface = wl_compositor_create_surface(_compositor);
+        }
     }
 
     WaylandWindowManager::~WaylandWindowManager()
     {
-        if (_keyboard) wl_keyboard_destroy(_keyboard);
-        if (_pointer) wl_pointer_destroy(_pointer);
-        if (_seat) wl_seat_destroy(_seat);
+        std::vector<std::uint64_t> ids;
+        for (const auto& window : _windows)
+        {
+            ids.push_back(window.first);
+        }
+        for (const auto id : ids)
+        {
+            Destroy(id);
+        }
+
+        if (_keyboard) wl_keyboard_release(_keyboard);
+        if (_pointer) wl_pointer_release(_pointer);
+        if (_seat) wl_seat_release(_seat);
+        for (const auto& output : _outputScales)
+        {
+            wl_output_release(output.first);
+        }
+        if (_cursorSurface) wl_surface_destroy(_cursorSurface);
+        if (_cursorTheme) wl_cursor_theme_destroy(_cursorTheme);
+        if (_shm) wl_shm_destroy(_shm);
         if (_decorContext) libdecor_unref(_decorContext);
         if (_compositor) wl_compositor_destroy(_compositor);
         if (_registry) wl_registry_destroy(_registry);
@@ -695,14 +938,21 @@ namespace rwin
         windowInfo->windowManager = this;
         windowInfo->surface = surface;
         _surfaceToWindows.insert_or_assign(surface, windowInfo);
+        wl_surface_add_listener(surface, &_surfaceListener, this);
         windowInfo->flags = flags;
         windowInfo->size = size;
         windowInfo->frame = frame;
 
-        libdecor_frame_set_title(frame, title.data());
-        libdecor_frame_set_app_id(frame, "rin_app");
+        const std::string titleString{title};
+        libdecor_frame_set_title(frame, titleString.c_str());
+        libdecor_frame_set_app_id(frame, "rwin");
+        if (!flags.Has(WindowFlags::Resizable))
+        {
+            libdecor_frame_unset_capabilities(frame, LIBDECOR_ACTION_RESIZE);
+        }
         libdecor_frame_map(frame);
-        PumpEvents();
+        wl_display_roundtrip(_display);
+        wl_display_roundtrip(_display);
         return windowId;
     }
 
@@ -710,26 +960,35 @@ namespace rwin
     {
         if (id == _cursorFocusedHandle)
         {
-            _cursorFocusedHandle = std::numeric_limits<std::uint64_t>::max();
+            _cursorFocusedHandle = UINT64_NULL_HANDLE;
         }
 
         if (id == _keyboardFocusedHandle)
         {
-            _keyboardFocusedHandle = std::numeric_limits<std::uint64_t>::max();
+            _keyboardFocusedHandle = UINT64_NULL_HANDLE;
+            _repeatKeycode = 0;
         }
-        if (const auto info = GetWindowInfo(id))
+
+        const auto found = _windows.find(id);
+        if (found == _windows.end())
         {
-            libdecor_frame_unref(info->frame);
-            wl_surface_destroy(info->surface);
-            _windows.erase(id);
+            return;
         }
+
+        const auto info = found->second;
+        libdecor_frame_unref(info->frame);
+        wl_surface_destroy(info->surface);
+        _surfaceToWindows.erase(info->surface);
+        _windows.erase(found);
+        std::erase_if(_pendingEvents, [id](const WindowEvent& event) { return event.info.windowId == id; });
+        _idFactory.Free(id);
     }
 
     Extent2D WaylandWindowManager::GetClientSize(const std::uint64_t& id)
     {
         if (const auto info = GetWindowInfo(id))
         {
-            return info->size;
+            return GetPhysicalSize(info);
         }
         return {};
     }
@@ -779,7 +1038,90 @@ namespace rwin
 
     float WaylandWindowManager::GetDpi(const std::uint64_t& id)
     {
+        if (const auto info = GetWindowInfo(id))
+        {
+            return GetDefaultDpi() * static_cast<float>(info->scale);
+        }
         return GetDefaultDpi();
+    }
+
+    Extent2D WaylandWindowManager::GetPhysicalSize(const WindowInfo* info) const
+    {
+        const auto scale = static_cast<std::uint32_t>(info->scale);
+        return Extent2D{info->size.width * scale, info->size.height * scale};
+    }
+
+    void WaylandWindowManager::ApplyScale(WindowInfo* info, const std::int32_t scale)
+    {
+        const auto clamped = std::max(scale, 1);
+        if (clamped == info->scale)
+        {
+            return;
+        }
+
+        info->scale = clamped;
+        wl_surface_set_buffer_scale(info->surface, clamped);
+
+        WindowEvent ev{};
+        new(&ev.resize) ResizeEvent{
+            .type = WindowEventType::Resize,
+            .windowId = info->windowId,
+            .size = GetPhysicalSize(info),
+        };
+        _pendingEvents.push_back(ev);
+    }
+
+    void WaylandWindowManager::UpdateScaleFromOutputs(WindowInfo* info)
+    {
+        if (_hasPreferredBufferScale)
+        {
+            return;
+        }
+
+        std::int32_t scale = 1;
+        for (const auto output : info->outputs)
+        {
+            if (const auto found = _outputScales.find(output); found != _outputScales.end())
+            {
+                scale = std::max(scale, found->second);
+            }
+        }
+        ApplyScale(info, scale);
+    }
+
+    void WaylandWindowManager::FlushScroll()
+    {
+        if (_scrollContinuous.x == 0.0f && _scrollContinuous.y == 0.0f &&
+            _scrollDiscrete120.x == 0.0f && _scrollDiscrete120.y == 0.0f)
+        {
+            return;
+        }
+
+        const auto info = GetWindowInfo(_cursorFocusedHandle);
+        if (info)
+        {
+            const auto scale = static_cast<float>(info->scale);
+            const auto notchPixels = SCROLL_DEFAULT_LINES_PER_NOTCH * SCROLL_LINE_PIXELS * scale;
+            const auto convert = [&](const float continuous, const float discrete120)
+            {
+                return discrete120 != 0.0f ? discrete120 / 120.0f * notchPixels : continuous * scale;
+            };
+
+            WindowEvent ev{};
+            new(&ev.scroll) ScrollEvent{
+                .type = WindowEventType::Scroll,
+                .windowId = info->windowId,
+                .position = info->cursorPosition,
+                .delta = Vector2{
+                    convert(_scrollContinuous.x, _scrollDiscrete120.x),
+                    -convert(_scrollContinuous.y, _scrollDiscrete120.y),
+                },
+            };
+            _pendingEvents.push_back(ev);
+        }
+
+        _scrollContinuous = {};
+        _scrollDiscrete120 = {};
     }
 
     float WaylandWindowManager::GetDefaultDpi()
@@ -787,9 +1129,223 @@ namespace rwin
         return 72.0f;
     }
 
+    void WaylandWindowManager::DispatchEvents()
+    {
+        if (libdecor_dispatch(_decorContext, 0) < 0)
+        {
+            _connectionLost = true;
+        }
+        wl_display_dispatch_pending(_display);
+
+        while (wl_display_prepare_read(_display) != 0)
+        {
+            wl_display_dispatch_pending(_display);
+        }
+        wl_display_flush(_display);
+
+        pollfd descriptor{wl_display_get_fd(_display), POLLIN, 0};
+        if (poll(&descriptor, 1, 0) > 0)
+        {
+            if (wl_display_read_events(_display) < 0)
+            {
+                _connectionLost = true;
+            }
+        }
+        else
+        {
+            wl_display_cancel_read(_display);
+        }
+
+        if (wl_display_dispatch_pending(_display) < 0)
+        {
+            _connectionLost = true;
+        }
+    }
+
     void WaylandWindowManager::PumpEvents()
     {
-        wl_display_roundtrip(_display);
+        if (_pendingEvents.empty())
+        {
+            _textArena.Reset();
+        }
+
+        if (_connectionLost)
+        {
+            return;
+        }
+
+        DispatchEvents();
+        ProcessKeyRepeat();
+
+        if (_connectionLost)
+        {
+            std::cerr << "rwin: lost the connection to the Wayland compositor" << std::endl;
+            for (const auto& window : _windows)
+            {
+                WindowEvent ev{};
+                new(&ev.close) CloseEvent{
+                    .type = WindowEventType::Close,
+                    .windowId = window.first,
+                };
+                _pendingEvents.push_back(ev);
+            }
+        }
+    }
+
+    Flags<InputModifier> WaylandWindowManager::CurrentModifiers()
+    {
+        if (_keyboard)
+        {
+            if (const auto found = _keyboards.find(_keyboard); found != _keyboards.end())
+            {
+                return getInputModifiers(found->second->state);
+            }
+        }
+        return {};
+    }
+
+    void WaylandWindowManager::HandleKey(KeyboardInfo& keyboard, const std::uint32_t keycode, const InputState state)
+    {
+        const auto info = GetWindowInfo(_keyboardFocusedHandle);
+        if (!info)
+        {
+            return;
+        }
+
+        const xkb_keysym_t* symbols = nullptr;
+        const auto layout = xkb_state_key_get_layout(keyboard.state, keycode);
+        const auto symbolCount = xkb_keymap_key_get_syms_by_level(keyboard.keymap, keycode, layout, 0, &symbols);
+        const auto key = symbolCount > 0 ? xkbKeyToInputKey(symbols[0]) : InputKey::Unknown;
+        const auto modifiers = getInputModifiers(keyboard.state);
+
+        WindowEvent ev{};
+        new(&ev.key) KeyEvent{
+            .type = WindowEventType::Key,
+            .windowId = info->windowId,
+            .key = key,
+            .state = state,
+            .modifier = static_cast<InputModifier>(modifiers)
+        };
+        _pendingEvents.push_back(ev);
+
+        const bool shortcut = modifiers.Has(InputModifier::Control) || modifiers.Has(InputModifier::Alt) ||
+            modifiers.Has(InputModifier::Super);
+        if (state == InputState::Released || !info->textInputActive || shortcut)
+        {
+            return;
+        }
+
+        char utf8[16]{};
+        const auto length = xkb_state_key_get_utf8(keyboard.state, keycode, utf8, sizeof(utf8));
+        if (length <= 0 || static_cast<unsigned char>(utf8[0]) < 0x20 || static_cast<unsigned char>(utf8[0]) == 0x7F)
+        {
+            return;
+        }
+
+        const auto text = utf8ToUtf16(std::string_view{utf8, static_cast<std::size_t>(length)});
+        if (text.empty())
+        {
+            return;
+        }
+
+        WindowEvent textEv{};
+        new(&textEv.textCommit) TextCommitEvent{
+            .type = WindowEventType::TextCommit,
+            .windowId = info->windowId,
+            .text = _textArena.Append(text),
+        };
+        _pendingEvents.push_back(textEv);
+    }
+
+    void WaylandWindowManager::ProcessKeyRepeat()
+    {
+        if (_repeatKeycode == 0 || !_keyboard || _repeatRate <= 0)
+        {
+            return;
+        }
+
+        const auto found = _keyboards.find(_keyboard);
+        if (found == _keyboards.end())
+        {
+            return;
+        }
+
+        const auto interval = std::chrono::milliseconds(std::max(1000 / _repeatRate, 1));
+        const auto now = std::chrono::steady_clock::now();
+        for (int emitted = 0; emitted < 8 && now >= _repeatNext; ++emitted)
+        {
+            HandleKey(*found->second, _repeatKeycode, InputState::Repeat);
+            _repeatNext += interval;
+        }
+        if (now >= _repeatNext)
+        {
+            _repeatNext = now + interval;
+        }
+    }
+
+    void WaylandWindowManager::ApplyCursor(const std::uint32_t serial, const std::int32_t scale)
+    {
+        if (!_pointer || !_shm || !_cursorSurface)
+        {
+            return;
+        }
+
+        if (!_cursorTheme || _cursorThemeScale != scale)
+        {
+            if (_cursorTheme)
+            {
+                wl_cursor_theme_destroy(_cursorTheme);
+            }
+            _cursorTheme = wl_cursor_theme_load(nullptr, 24 * scale, _shm);
+            _cursorThemeScale = scale;
+            _cursor = nullptr;
+            if (_cursorTheme)
+            {
+                _cursor = wl_cursor_theme_get_cursor(_cursorTheme, "default");
+                if (!_cursor) _cursor = wl_cursor_theme_get_cursor(_cursorTheme, "left_ptr");
+            }
+        }
+
+        if (!_cursor || _cursor->image_count == 0)
+        {
+            return;
+        }
+
+        const auto image = _cursor->images[0];
+        const auto buffer = wl_cursor_image_get_buffer(image);
+        if (!buffer)
+        {
+            return;
+        }
+
+        wl_surface_set_buffer_scale(_cursorSurface, scale);
+        wl_surface_attach(_cursorSurface, buffer, 0, 0);
+        wl_surface_damage_buffer(_cursorSurface, 0, 0, static_cast<std::int32_t>(image->width),
+                                 static_cast<std::int32_t>(image->height));
+        wl_surface_commit(_cursorSurface);
+        wl_pointer_set_cursor(_pointer, serial, _cursorSurface, static_cast<std::int32_t>(image->hotspot_x) / scale,
+                              static_cast<std::int32_t>(image->hotspot_y) / scale);
+    }
+
+    void WaylandWindowManager::StartTextInput(const std::uint64_t& id, const Rect2D&)
+    {
+        if (const auto info = GetWindowInfo(id))
+        {
+            info->textInputActive = true;
+        }
+    }
+
+    void WaylandWindowManager::StopTextInput(const std::uint64_t& id)
+    {
+        if (const auto info = GetWindowInfo(id))
+        {
+            info->textInputActive = false;
+        }
+    }
+
+    std::u16string_view WaylandWindowManager::GetEventText(const TextRef& ref)
+    {
+        return _textArena.View(ref);
     }
 
     void WaylandWindowManager::GetRequiredExtensions(std::vector<const char*>& extensions)
