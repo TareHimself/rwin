@@ -3,7 +3,7 @@ cmake-build*
 CMakeUserPresets.json
 vcpkg_installed
 /build
-/conan
 .DS_Store
 .venv/
 .silo/
+/build-glfw
