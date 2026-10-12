@@ -37,6 +37,10 @@ namespace rwin {
         void StopTextInput(const std::uint64_t& id) override;
         void SetTextInputRect(const std::uint64_t& id, const Rect2D& caret) override;
         std::u16string_view GetEventText(const TextRef& ref) override;
+        bool HasClipboardText() override;
+        bool GetClipboardText(std::u16string& out) override;
+        bool SetClipboardText(std::u16string_view text) override;
+        void ClearClipboard() override;
 
     private:
         // Window table and event queue live per manager; defined in the .mm to keep AppKit out of the header.

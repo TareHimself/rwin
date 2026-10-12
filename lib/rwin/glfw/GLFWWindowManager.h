@@ -57,6 +57,14 @@ namespace rwin
 
         std::u16string_view GetEventText(const TextRef &ref) override;
 
+        bool HasClipboardText() override;
+
+        bool GetClipboardText(std::u16string &out) override;
+
+        bool SetClipboardText(std::u16string_view text) override;
+
+        void ClearClipboard() override;
+
     private:
         // Window table and event queue live per manager; defined in the .cpp to keep GLFW out of the header.
         struct Impl;

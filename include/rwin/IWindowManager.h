@@ -45,6 +45,12 @@ namespace rwin {
         // Text for a TextCommit/TextPreedit event. Valid until the next PumpEvents call, so read or
         // copy it while draining events.
         virtual std::u16string_view GetEventText(const TextRef&) { return {}; }
+
+        // Clipboard text is UTF-16. Backends without clipboard support keep these failing no-ops.
+        virtual bool HasClipboardText() { return false; }
+        virtual bool GetClipboardText(std::u16string&) { return false; }
+        virtual bool SetClipboardText(std::u16string_view) { return false; }
+        virtual void ClearClipboard() {}
         static IWindowManager* Get();
     };
 }

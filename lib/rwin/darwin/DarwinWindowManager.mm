@@ -4,6 +4,7 @@
 
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
+#import <IOKit/hidsystem/IOLLEvent.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <vulkan/vulkan_metal.h>
@@ -16,7 +17,7 @@
 #include <vector>
 
 #include "rwin/IdFactory.h"
-#include "rwin/IDropContext.h"
+#include "../DropDispatch.h"
 #include "../TextArena.h"
 
 // Forward declarations for ObjC classes used in WindowInfo
@@ -42,6 +43,7 @@ namespace {
         Rect2D caretRect{}; // window-local backing pixels, pushed by SetTextInputRect
         std::function<HitTestResult(const Vector2&)> hitTestCallback{};
         DropCallbacks dropCallbacks{};
+        DropEffect dragEnterEffect{DropEffect::None}; // enter's answer, reused when `over` is not set
         bool zoomed{false}; // last observed zoom state, so Maximize fires once per transition
     };
 
@@ -176,36 +178,55 @@ namespace {
 // ---------------------------------------------------------------------------
 // Drop context
 // ---------------------------------------------------------------------------
-struct DarwinDropContext final : rwin::IDropContext {
+struct DarwinDataView final : rwin::IDataView {
     __strong NSPasteboard* pasteboard{nil};
 
-    bool HasFiles() override {
+    bool HasFiles() const override {
         return [pasteboard canReadObjectForClasses:@[NSURL.class]
                                           options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
     }
 
-    bool HasText() override {
+    bool HasText() const override {
         return [pasteboard availableTypeFromArray:@[NSPasteboardTypeString]] != nil;
     }
 
-    bool GetFiles(std::vector<std::filesystem::path>& paths) override {
+    bool GetFiles(std::vector<std::filesystem::path>& paths) const override {
         NSArray* urls = [pasteboard readObjectsForClasses:@[NSURL.class]
                                                   options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
         for (NSURL* url in urls) {
             paths.emplace_back(url.fileSystemRepresentation);
         }
-        return !paths.empty();
+        return urls.count > 0;
     }
 
-    bool GetText(std::vector<std::string>& text) override {
+    bool GetText(std::u16string& out) const override {
         NSString* str = [pasteboard stringForType:NSPasteboardTypeString];
-        if (str) {
-            text.emplace_back(str.UTF8String);
-            return true;
-        }
-        return false;
+        if (!str) return false;
+        static_assert(sizeof(unichar) == sizeof(char16_t));
+        out.assign(str.length, u'\0');
+        [str getCharacters:reinterpret_cast<unichar*>(out.data()) range:NSMakeRange(0, str.length)];
+        return true;
     }
 };
+
+namespace {
+    Flags<DropEffect> ToDropEffects(NSDragOperation mask) {
+        Flags<DropEffect> result{};
+        if (mask & NSDragOperationCopy) result.Add(DropEffect::Copy);
+        if (mask & NSDragOperationMove) result.Add(DropEffect::Move);
+        if (mask & NSDragOperationLink) result.Add(DropEffect::Link);
+        return result;
+    }
+
+    NSDragOperation ToDragOperation(DropEffect effect) {
+        switch (effect) {
+        case DropEffect::Copy: return NSDragOperationCopy;
+        case DropEffect::Move: return NSDragOperationMove;
+        case DropEffect::Link: return NSDragOperationLink;
+        default:               return NSDragOperationNone;
+        }
+    }
+} // anonymous namespace
 
 // ---------------------------------------------------------------------------
 // Window delegate
@@ -492,15 +513,16 @@ namespace {
     rwin::InputKey key  = rwin::InputKey::Unknown;
     bool pressed        = false;
     NSEventModifierFlags mods = [event modifierFlags];
+    // Per-side bits; the shared NSEventModifierFlag* flags stay set while the other side is held.
     switch ([event keyCode]) {
-    case kVK_Shift:        key = rwin::InputKey::LeftShift;    pressed = (mods & NSEventModifierFlagShift)    != 0; break;
-    case kVK_RightShift:   key = rwin::InputKey::RightShift;   pressed = (mods & NSEventModifierFlagShift)    != 0; break;
-    case kVK_Control:      key = rwin::InputKey::LeftControl;  pressed = (mods & NSEventModifierFlagControl)  != 0; break;
-    case kVK_RightControl: key = rwin::InputKey::RightControl; pressed = (mods & NSEventModifierFlagControl)  != 0; break;
-    case kVK_Option:       key = rwin::InputKey::LeftAlt;      pressed = (mods & NSEventModifierFlagOption)   != 0; break;
-    case kVK_RightOption:  key = rwin::InputKey::RightAlt;     pressed = (mods & NSEventModifierFlagOption)   != 0; break;
-    case kVK_Command:      key = rwin::InputKey::LeftSuper;    pressed = (mods & NSEventModifierFlagCommand)  != 0; break;
-    case 0x36:             key = rwin::InputKey::RightSuper;   pressed = (mods & NSEventModifierFlagCommand)  != 0; break; // kVK_RightCommand
+    case kVK_Shift:        key = rwin::InputKey::LeftShift;    pressed = (mods & NX_DEVICELSHIFTKEYMASK) != 0; break;
+    case kVK_RightShift:   key = rwin::InputKey::RightShift;   pressed = (mods & NX_DEVICERSHIFTKEYMASK) != 0; break;
+    case kVK_Control:      key = rwin::InputKey::LeftControl;  pressed = (mods & NX_DEVICELCTLKEYMASK)   != 0; break;
+    case kVK_RightControl: key = rwin::InputKey::RightControl; pressed = (mods & NX_DEVICERCTLKEYMASK)   != 0; break;
+    case kVK_Option:       key = rwin::InputKey::LeftAlt;      pressed = (mods & NX_DEVICELALTKEYMASK)   != 0; break;
+    case kVK_RightOption:  key = rwin::InputKey::RightAlt;     pressed = (mods & NX_DEVICERALTKEYMASK)   != 0; break;
+    case kVK_Command:      key = rwin::InputKey::LeftSuper;    pressed = (mods & NX_DEVICELCMDKEYMASK)   != 0; break;
+    case 0x36:             key = rwin::InputKey::RightSuper;   pressed = (mods & NX_DEVICERCMDKEYMASK)   != 0; break; // kVK_RightCommand
     case kVK_CapsLock:     key = rwin::InputKey::CapsLock;     pressed = (mods & NSEventModifierFlagCapsLock) != 0; break;
     default: return;
     }
@@ -720,48 +742,46 @@ namespace {
 
 // Drag and drop
 
+- (rwin::DropInfo)dropInfo:(id<NSDraggingInfo>)sender {
+    NSPoint p = [self dragPos:sender];
+    return rwin::DropInfo{
+        .position  = {.x = static_cast<float>(p.x), .y = static_cast<float>(p.y)},
+        .allowed   = ToDropEffects([sender draggingSourceOperationMask]),
+        .modifiers = ToInputModifier([NSEvent modifierFlags]),
+    };
+}
+
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
     auto* info = self.info;
-    if (!info || !info->dropCallbacks.enter)
-        return NSDragOperationNone;
-    NSPoint p = [self dragPos:sender];
-    DarwinDropContext ctx;
-    ctx.pasteboard = [sender draggingPasteboard];
-    bool ok = info->dropCallbacks.enter(
-        {.x = static_cast<float>(p.x), .y = static_cast<float>(p.y)}, &ctx);
-    return ok ? NSDragOperationCopy : NSDragOperationNone;
+    if (!info) return NSDragOperationNone;
+    DarwinDataView data;
+    data.pasteboard = [sender draggingPasteboard];
+    info->dragEnterEffect = rwin::DispatchDropEnter(&info->dropCallbacks, [self dropInfo:sender], data);
+    return ToDragOperation(info->dragEnterEffect);
 }
 
 - (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
     auto* info = self.info;
-    if (!info || !info->dropCallbacks.over)
-        return NSDragOperationNone;
-    NSPoint p = [self dragPos:sender];
-    DarwinDropContext ctx;
-    ctx.pasteboard = [sender draggingPasteboard];
-    bool ok = info->dropCallbacks.over(
-        {.x = static_cast<float>(p.x), .y = static_cast<float>(p.y)}, &ctx);
-    return ok ? NSDragOperationCopy : NSDragOperationNone;
+    if (!info) return NSDragOperationNone;
+    DarwinDataView data;
+    data.pasteboard = [sender draggingPasteboard];
+    return ToDragOperation(rwin::DispatchDropOver(
+        &info->dropCallbacks, [self dropInfo:sender], data, info->dragEnterEffect));
 }
 
 - (void)draggingExited:(id<NSDraggingInfo>)sender {
     auto* info = self.info;
-    if (info && info->dropCallbacks.leave)
-        info->dropCallbacks.leave();
+    if (info) rwin::DispatchDropLeave(&info->dropCallbacks);
 }
 
 - (BOOL)prepareForDragOperation:(id<NSDraggingInfo>)sender { return YES; }
 
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
     auto* info = self.info;
-    if (!info || !info->dropCallbacks.drop)
-        return NO;
-    NSPoint p = [self dragPos:sender];
-    DarwinDropContext ctx;
-    ctx.pasteboard = [sender draggingPasteboard];
-    info->dropCallbacks.drop(
-        {.x = static_cast<float>(p.x), .y = static_cast<float>(p.y)}, &ctx);
-    return YES;
+    if (!info) return NO;
+    DarwinDataView data;
+    data.pasteboard = [sender draggingPasteboard];
+    return rwin::DispatchDrop(&info->dropCallbacks, [self dropInfo:sender], data) != rwin::DropEffect::None;
 }
 
 @end
@@ -894,11 +914,6 @@ std::uint64_t DarwinWindowManager::Create(const std::string_view& title, const E
         metalLayer.contentsScale = scale;
         metalLayer.drawableSize  = CGSizeMake(size.width * scale, size.height * scale);
 
-        if (flags.Has(WindowFlags::DragAndDrop)) {
-            [view registerForDraggedTypes:
-                @[NSPasteboardTypeFileURL, NSPasteboardTypeString]];
-        }
-
         const auto windowId = _impl->idFactory.New();
 
         RWINWindowDelegate* delegate = [[RWINWindowDelegate alloc] init];
@@ -1009,9 +1024,7 @@ float DarwinWindowManager::GetDpi(const std::uint64_t& id) {
 }
 
 float DarwinWindowManager::GetDefaultDpi() {
-    NSScreen* screen = [NSScreen mainScreen];
-    if (!screen) return 96.0f;
-    return 96.0f * static_cast<float>(screen.backingScaleFactor);
+    return 96.0f;
 }
 
 void DarwinWindowManager::PumpEvents() {
@@ -1062,6 +1075,39 @@ void DarwinWindowManager::ClearDropCallbacks(const std::uint64_t& id) {
     if (!info) return;
     info->dropCallbacks = {};
     [info->view unregisterDraggedTypes];
+}
+
+bool DarwinWindowManager::HasClipboardText() {
+    @autoreleasepool {
+        DarwinDataView data;
+        data.pasteboard = [NSPasteboard generalPasteboard];
+        return data.HasText();
+    }
+}
+
+bool DarwinWindowManager::GetClipboardText(std::u16string& out) {
+    @autoreleasepool {
+        DarwinDataView data;
+        data.pasteboard = [NSPasteboard generalPasteboard];
+        return data.GetText(out);
+    }
+}
+
+bool DarwinWindowManager::SetClipboardText(const std::u16string_view text) {
+    @autoreleasepool {
+        static_assert(sizeof(unichar) == sizeof(char16_t));
+        NSString* string = [NSString stringWithCharacters:reinterpret_cast<const unichar*>(text.data())
+                                                   length:text.size()];
+        NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+        [pasteboard clearContents];
+        return [pasteboard setString:string forType:NSPasteboardTypeString];
+    }
+}
+
+void DarwinWindowManager::ClearClipboard() {
+    @autoreleasepool {
+        [[NSPasteboard generalPasteboard] clearContents];
+    }
 }
 
 void DarwinWindowManager::StartTextInput(const std::uint64_t& id, const Rect2D& caret) {

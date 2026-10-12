@@ -8,7 +8,6 @@
 #include <thread>
 #include <vulkan/vulkan_core.h>
 #include <imgui_impl_vulkan.h>
-#include "rwin/DropCallbacks.h"
 #include "rwin/rwin.h"
 #include "ImGuiRwin.h"
 using namespace rwin;
@@ -341,7 +340,7 @@ int main()
 {
     initVulkan();
     const auto windowId = createWindow("Hello World", {1280, 720},
-                                       WindowFlags::Visible | WindowFlags::Resizable | WindowFlags::DragAndDrop);
+                                       WindowFlags::Visible | WindowFlags::Resizable);
     initVulkanWindow(windowId);
     imguirwin::init(windowId);
     setWindowHitTestCallback(windowId, [windowId](const Vector2& point)
@@ -372,44 +371,6 @@ int main()
 
         return HitTestResult::None;
     });
-    setWindowDropCallbacks(windowId, DropCallbacks{
-                               .enter = [](const Vector2& pos, IDropContext* ctx)
-                               {
-                                   std::cout << "Drag Enter" << std::endl;
-                                   return true;
-                               },
-                               .over = [](const Vector2& pos, IDropContext* ctx)
-                               {
-                                   return true;
-                               },
-                               .drop = [](const Vector2& pos, IDropContext* ctx)
-                               {
-                                   std::cout << "Drag Drop" << std::endl;
-                                   if (ctx->HasFiles())
-                                   {
-                                       std::vector<std::filesystem::path> files{};
-                                       ctx->GetFiles(files);
-                                       for (auto &path : files)
-                                       {
-                                           std::cout << "file: " << path << std::endl;
-                                       }
-                                   }
-
-                                   if (ctx->HasText())
-                                   {
-                                       std::vector<std::string> texts{};
-                                       ctx->GetText(texts);
-                                       for (auto &text : texts)
-                                       {
-                                           std::cout << "text: " << text << std::endl;
-                                       }
-                                   }
-                               },
-                               .leave = []()
-                               {
-                                   std::cout << "Drag Leave" << std::endl;
-                               }
-                           });
     std::vector<WindowEvent> events{};
     events.resize(64);
     auto quit = false;
