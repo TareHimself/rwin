@@ -30,4 +30,9 @@ namespace rwin
     RWIN_API void stopTextInput(const std::uint64_t& id);
     RWIN_API void setTextInputRect(const std::uint64_t& id, const Rect2D& caret);
     RWIN_API std::u16string_view getEventText(const TextRef& ref);
+    RWIN_API bool hasClipboardText();
+    // Returns false and leaves `out` alone if the clipboard is empty or does not hold text.
+    RWIN_API bool getClipboardText(std::u16string& out);
+    RWIN_API bool setClipboardText(std::u16string_view text);
+    RWIN_API void clearClipboard();
 }

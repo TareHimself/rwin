@@ -13,13 +13,13 @@ namespace rwin
         ContainedType _value{0};
 
     public:
-        Flags() = default;
+        constexpr Flags() = default;
 
-        Flags(const ContainedType& value) : _value(value)
+        constexpr Flags(const ContainedType& value) : _value(value)
         {
         }
 
-        Flags(const T& value) : _value(static_cast<ContainedType>(value))
+        constexpr Flags(const T& value) : _value(static_cast<ContainedType>(value))
         {
         }
 
@@ -33,16 +33,14 @@ namespace rwin
             return static_cast<T>(_value);
         }
 
-        Flags& operator&(const T& other)
+        constexpr Flags operator&(const T& other) const
         {
-            _value &= static_cast<ContainedType>(other);
-            return *this;
+            return Flags(static_cast<ContainedType>(_value & static_cast<ContainedType>(other)));
         }
 
-        Flags& operator|(const T& other)
+        constexpr Flags operator|(const T& other) const
         {
-            _value |= static_cast<ContainedType>(other);
-            return *this;
+            return Flags(static_cast<ContainedType>(_value | static_cast<ContainedType>(other)));
         }
 
         bool Has(const T& value) const

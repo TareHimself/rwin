@@ -76,13 +76,6 @@ namespace rwin
         MaximizeButton,
     };
 
-    enum class WindowDropFormat
-    {
-        File,
-        Image,
-        Text,
-    };
-
     enum class WindowEventType : uint32_t
     {
         Key,
@@ -96,9 +89,6 @@ namespace rwin
         TextCommit,
         CursorFocus,
         KeyboardFocus,
-        DndEnter,
-        DndDrop,
-        DndLeave,
         TextPreedit
     };
 
@@ -244,8 +234,7 @@ namespace rwin
         Resizable =  1 << 2,
         Visible =  1 << 3,
         Transparent =  1 << 4,
-        Focused =  1 << 5,
-        DragAndDrop =  1 << 5
+        Focused =  1 << 5
     };
 
     struct EventInfo

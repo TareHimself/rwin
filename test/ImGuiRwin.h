@@ -6,7 +6,9 @@
 #include <deque>
 #include <filesystem>
 #include <string>
+#include <vector>
 #include <imgui.h>
+#include "rwin/DropCallbacks.h"
 #include "rwin/rwin.h"
 
 namespace imguirwin
@@ -28,6 +30,13 @@ namespace imguirwin
         float lastScrollNotches{0.0f};
         std::string textBuffer = std::string(512, '\0');
         std::string multilineBuffer = std::string(2048, '\0');
+        std::string clipboard{};
+        std::string clipboardPreview{};
+        bool dragActive{false};
+        bool dragOverTarget{false};
+        ImVec2 dropTargetMin{};
+        ImVec2 dropTargetMax{};
+        std::vector<std::string> dropped{};
     };
 
     inline State& state()
@@ -67,6 +76,38 @@ namespace imguirwin
                 out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
                 out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
                 out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+        }
+        return out;
+    }
+
+    inline std::u16string toUtf16(const std::string_view text)
+    {
+        std::u16string out;
+        for (std::size_t i = 0; i < text.size();)
+        {
+            const auto lead = static_cast<unsigned char>(text[i]);
+            const std::size_t length = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+            if (i + length > text.size())
+            {
+                break;
+            }
+            char32_t cp = length == 1 ? lead : lead & (0xFF >> (length + 1));
+            for (std::size_t j = 1; j < length; ++j)
+            {
+                cp = (cp << 6) | (static_cast<unsigned char>(text[i + j]) & 0x3F);
+            }
+            i += length;
+
+            if (cp >= 0x10000)
+            {
+                cp -= 0x10000;
+                out += static_cast<char16_t>(0xD800 + (cp >> 10));
+                out += static_cast<char16_t>(0xDC00 + (cp & 0x3FF));
+            }
+            else
+            {
+                out += static_cast<char16_t>(cp);
             }
         }
         return out;
@@ -188,6 +229,66 @@ namespace imguirwin
 
         loadFonts();
 
+        ImGui::GetPlatformIO().Platform_GetClipboardTextFn = [](ImGuiContext*) -> const char*
+        {
+            auto& s = state();
+            std::u16string text;
+            s.clipboard = rwin::getClipboardText(text) ? toUtf8(text) : std::string{};
+            return s.clipboard.c_str();
+        };
+        ImGui::GetPlatformIO().Platform_SetClipboardTextFn = [](ImGuiContext*, const char* text)
+        {
+            rwin::setClipboardText(toUtf16(text));
+        };
+
+        rwin::setWindowDropCallbacks(windowId, rwin::DropCallbacks{
+            .enter = [](const rwin::DropInfo&, const rwin::IDataView& data)
+            {
+                state().dragActive = true;
+                pushLog("drag enter");
+                return data.HasFiles() || data.HasText() ? rwin::DropEffect::Copy : rwin::DropEffect::None;
+            },
+            // Only the drop box accepts, which exercises a different answer per position.
+            .over = [](const rwin::DropInfo& info, const rwin::IDataView&)
+            {
+                auto& s = state();
+                s.dragOverTarget = info.position.x >= s.dropTargetMin.x && info.position.x < s.dropTargetMax.x &&
+                    info.position.y >= s.dropTargetMin.y && info.position.y < s.dropTargetMax.y;
+                return s.dragOverTarget ? rwin::DropEffect::Copy : rwin::DropEffect::None;
+            },
+            .drop = [](const rwin::DropInfo&, const rwin::IDataView& data)
+            {
+                auto& s = state();
+                s.dragActive = false;
+                s.dragOverTarget = false;
+                s.dropped.clear();
+
+                std::vector<std::filesystem::path> files;
+                if (data.GetFiles(files))
+                {
+                    for (const auto& file : files)
+                    {
+                        s.dropped.push_back("file: " + toUtf8(file.u16string()));
+                    }
+                }
+
+                std::u16string text;
+                if (data.GetText(text))
+                {
+                    s.dropped.push_back("text: " + toUtf8(text));
+                }
+
+                pushLog("drop: " + std::to_string(s.dropped.size()) + " item(s)");
+                return s.dropped.empty() ? rwin::DropEffect::None : rwin::DropEffect::Copy;
+            },
+            .leave = []
+            {
+                state().dragActive = false;
+                state().dragOverTarget = false;
+                pushLog("drag leave");
+            },
+        });
+
         ImGui::GetPlatformIO().Platform_SetImeDataFn = [](ImGuiContext*, ImGuiViewport*, ImGuiPlatformImeData* data)
         {
             auto& s = state();
@@ -245,6 +346,13 @@ namespace imguirwin
             }
         case WindowEventType::Key:
             {
+                // ImGui only honours shortcuts like Ctrl+V when the modifiers are sent as their own keys.
+                const rwin::Flags<rwin::InputModifier> mods{event.key.modifier};
+                io.AddKeyEvent(ImGuiMod_Ctrl, mods.Has(rwin::InputModifier::Control));
+                io.AddKeyEvent(ImGuiMod_Shift, mods.Has(rwin::InputModifier::Shift));
+                io.AddKeyEvent(ImGuiMod_Alt, mods.Has(rwin::InputModifier::Alt));
+                io.AddKeyEvent(ImGuiMod_Super, mods.Has(rwin::InputModifier::Super));
+
                 const auto key = mapKey(event.key.key);
                 if (key != ImGuiKey_None)
                 {
@@ -379,6 +487,48 @@ namespace imguirwin
         ImGui::InputTextMultiline("multi line", s.multilineBuffer.data(), s.multilineBuffer.size(),
                                   ImVec2{0.0f, 70.0f * scale});
         ImGui::Text("preedit: [%s]", s.preedit.c_str());
+
+        ImGui::SeparatorText("Clipboard");
+        ImGui::TextDisabled("Copy, cut and paste shortcuts work in the text fields above.");
+        if (ImGui::Button("Copy single line"))
+        {
+            rwin::setClipboardText(toUtf16(s.textBuffer.c_str()));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Read"))
+        {
+            std::u16string text;
+            s.clipboardPreview = rwin::getClipboardText(text) ? toUtf8(text) : "<no text>";
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear"))
+        {
+            rwin::clearClipboard();
+        }
+        ImGui::SameLine();
+        ImGui::Text("has text: %s", rwin::hasClipboardText() ? "yes" : "no");
+        ImGui::TextWrapped("read: %s", s.clipboardPreview.c_str());
+
+        ImGui::SeparatorText("Drag and drop");
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(
+                                  s.dragOverTarget ? ImGuiCol_FrameBgHovered : s.dragActive ? ImGuiCol_FrameBg : ImGuiCol_ChildBg));
+        ImGui::BeginChild("dropTarget", ImVec2{0.0f, 90.0f * scale}, ImGuiChildFlags_Borders);
+        s.dropTargetMin = ImGui::GetWindowPos();
+        s.dropTargetMax = ImVec2{s.dropTargetMin.x + ImGui::GetWindowSize().x, s.dropTargetMin.y + ImGui::GetWindowSize().y};
+        if (s.dragActive)
+        {
+            ImGui::TextUnformatted(s.dragOverTarget ? "Release to drop" : "Drag into this box");
+        }
+        else if (s.dropped.empty())
+        {
+            ImGui::TextDisabled("Drop files or text here");
+        }
+        for (const auto& line : s.dropped)
+        {
+            ImGui::TextUnformatted(line.c_str());
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
 
         ImGui::SeparatorText("Events");
         ImGui::BeginChild("eventLog", ImVec2{0.0f, 0.0f}, ImGuiChildFlags_Borders);

@@ -1,0 +1,17 @@
+[project]
+name = "rwin"
+version = "1.0.0"
+description = "Tooling for building rwin: `uv sync`, then `uv run silo build .`"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "silo",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+silo = { git = "https://github.com/TareHimself/silo", subdirectory = "client" }

@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            runner: windows-2025
+            options: ""
+          - name: macos
+            runner: macos-26
+            options: ""
+          - name: linux-wayland
+            runner: ubuntu-24.04
+            options: ""
+          - name: windows-glfw
+            runner: windows-2025
+            options: "-o compat=true"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v10.3.0
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.silo/store
+          key: silo-store-${{ matrix.name }}-${{ hashFiles('silopkg.py', 'uv.lock') }}
+          restore-keys: silo-store-${{ matrix.name }}-
+
+      - run: uv sync
+      - run: uv run silo profile detect
+      - run: uv run silo build . ${{ matrix.options }} --report silo-report
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: silo-report-${{ matrix.name }}
+          path: silo-report

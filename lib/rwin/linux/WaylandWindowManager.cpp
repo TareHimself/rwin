@@ -2,10 +2,16 @@
 #if defined(RWIN_PLATFORM_LINUX) && defined(RWIN_PLATFORM_LINUX_WAYLAND)
 #include "WaylandWindowManager.h"
 #include "../ScrollUnits.h"
+#include "../DropDispatch.h"
+#include "../Utf.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <fcntl.h>
 #include <iostream>
 #include <poll.h>
+#include <span>
+#include <string_view>
 #include <ranges>
 #include <stdexcept>
 #include <unistd.h>
@@ -164,53 +170,181 @@ namespace rwin
 
     namespace
     {
-        std::u16string utf8ToUtf16(const std::string_view text)
-        {
-            std::u16string out;
-            for (std::size_t i = 0; i < text.size();)
-            {
-                const auto lead = static_cast<unsigned char>(text[i]);
-                std::size_t length = 1;
-                char32_t cp = lead;
-                if (lead >= 0xF0)
-                {
-                    length = 4;
-                    cp = lead & 0x07;
-                }
-                else if (lead >= 0xE0)
-                {
-                    length = 3;
-                    cp = lead & 0x0F;
-                }
-                else if (lead >= 0xC0)
-                {
-                    length = 2;
-                    cp = lead & 0x1F;
-                }
+        constexpr const char* TEXT_MIME_TYPES[] = {
+            "text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "TEXT", "STRING"
+        };
+        constexpr const char* URI_LIST_MIME_TYPE = "text/uri-list";
 
-                if (i + length > text.size())
+        const DropCallbacks* GetDropCallbacks(const WindowInfo* info)
+        {
+            return info->dropCallbacks.has_value() ? &*info->dropCallbacks : nullptr;
+        }
+
+        const char* FindMimeType(const DataOffer& offer, const std::span<const char* const> wanted)
+        {
+            for (const auto mimeType : wanted)
+            {
+                if (std::find(offer.mimeTypes.begin(), offer.mimeTypes.end(), std::string_view{mimeType}) !=
+                    offer.mimeTypes.end())
+                {
+                    return mimeType;
+                }
+            }
+            return nullptr;
+        }
+
+        // The offering client writes into a pipe; give up if it stalls for a second.
+        bool ReadOffer(wl_display* display, wl_data_offer* offer, const char* mimeType, std::string& out)
+        {
+            int fds[2];
+            if (pipe2(fds, O_CLOEXEC) != 0)
+            {
+                return false;
+            }
+            wl_data_offer_receive(offer, mimeType, fds[1]);
+            close(fds[1]);
+            wl_display_flush(display);
+
+            bool success = false;
+            std::string data;
+            char buffer[4096];
+            while (true)
+            {
+                pollfd descriptor{fds[0], POLLIN, 0};
+                const auto ready = poll(&descriptor, 1, 1000);
+                if (ready < 0 && errno == EINTR)
+                {
+                    continue;
+                }
+                if (ready <= 0)
                 {
                     break;
                 }
-                for (std::size_t j = 1; j < length; ++j)
-                {
-                    cp = (cp << 6) | (static_cast<unsigned char>(text[i + j]) & 0x3F);
-                }
-                i += length;
 
-                if (cp >= 0x10000)
+                const auto count = read(fds[0], buffer, sizeof(buffer));
+                if (count < 0 && errno == EINTR)
                 {
-                    cp -= 0x10000;
-                    out += static_cast<char16_t>(0xD800 + (cp >> 10));
-                    out += static_cast<char16_t>(0xDC00 + (cp & 0x3FF));
+                    continue;
+                }
+                if (count < 0)
+                {
+                    break;
+                }
+                if (count == 0)
+                {
+                    success = true;
+                    break;
+                }
+                data.append(buffer, static_cast<std::size_t>(count));
+            }
+            close(fds[0]);
+
+            if (success)
+            {
+                out = std::move(data);
+            }
+            return success;
+        }
+
+        std::string PercentDecode(const std::string_view text)
+        {
+            const auto hex = [](const char c)
+            {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+
+            std::string out;
+            for (std::size_t i = 0; i < text.size(); ++i)
+            {
+                if (text[i] == '%' && i + 2 < text.size() && hex(text[i + 1]) >= 0 && hex(text[i + 2]) >= 0)
+                {
+                    out += static_cast<char>(hex(text[i + 1]) * 16 + hex(text[i + 2]));
+                    i += 2;
                 }
                 else
                 {
-                    out += static_cast<char16_t>(cp);
+                    out += text[i];
                 }
             }
             return out;
         }
+
+        struct WaylandDataView final : IDataView
+        {
+            WaylandDataView(wl_display* display, const DataOffer* offer) : _display(display), _offer(offer)
+            {
+            }
+
+            bool HasText() const override
+            {
+                return FindMimeType(*_offer, TEXT_MIME_TYPES) != nullptr;
+            }
+
+            bool HasFiles() const override
+            {
+                return FindMimeType(*_offer, {&URI_LIST_MIME_TYPE, 1}) != nullptr;
+            }
+
+            bool GetText(std::u16string& out) const override
+            {
+                const auto mimeType = FindMimeType(*_offer, TEXT_MIME_TYPES);
+                std::string data;
+                if (!mimeType || !ReadOffer(_display, _offer->offer, mimeType, data))
+                {
+                    return false;
+                }
+                out = Utf8ToUtf16(data);
+                return true;
+            }
+
+            bool GetFiles(std::vector<std::filesystem::path>& out) const override
+            {
+                std::string data;
+                if (!HasFiles() || !ReadOffer(_display, _offer->offer, URI_LIST_MIME_TYPE, data))
+                {
+                    return false;
+                }
+
+                bool any = false;
+                for (std::size_t start = 0; start < data.size();)
+                {
+                    auto end = data.find('\n', start);
+                    if (end == std::string::npos)
+                    {
+                        end = data.size();
+                    }
+                    std::string_view line{data.data() + start, end - start};
+                    start = end + 1;
+
+                    if (!line.empty() && line.back() == '\r')
+                    {
+                        line.remove_suffix(1);
+                    }
+                    if (!line.starts_with("file://"))
+                    {
+                        continue;
+                    }
+                    line.remove_prefix(7);
+
+                    // Skips the optional host part of file://host/path.
+                    const auto pathStart = line.find('/');
+                    if (pathStart == std::string_view::npos)
+                    {
+                        continue;
+                    }
+                    out.emplace_back(PercentDecode(line.substr(pathStart)));
+                    any = true;
+                }
+                return any;
+            }
+
+        private:
+            wl_display* _display;
+            const DataOffer* _offer;
+        };
     }
 
     Flags<InputModifier> getInputModifiers(xkb_state* state)
@@ -332,6 +466,7 @@ namespace rwin
                       uint32_t state)
             {
                 const auto self = static_cast<WaylandWindowManager*>(data);
+                self->_lastInputSerial = serial;
                 if (self->_keyboardFocusedHandle == UINT64_NULL_HANDLE) return;
 
                 const auto found = self->_keyboards.find(wl_keyboard);
@@ -477,6 +612,7 @@ namespace rwin
             {
                 if (const auto self = static_cast<WaylandWindowManager*>(data))
                 {
+                    self->_lastInputSerial = serial;
                     if (const auto info = self->GetWindowInfo(self->_cursorFocusedHandle))
                     {
                         WindowEvent ev{};
@@ -676,6 +812,13 @@ namespace rwin
                     self->_seat = static_cast<wl_seat*>(wl_registry_bind(
                         registry, name, &wl_seat_interface, bindVersion));
                     wl_seat_add_listener(self->_seat, &self->_seatListener, self);
+                    self->CreateDataDevice();
+                }
+                else if (interfaceName == wl_data_device_manager_interface.name)
+                {
+                    self->_dataDeviceManager = static_cast<wl_data_device_manager*>(wl_registry_bind(
+                        registry, name, &wl_data_device_manager_interface, std::min<uint32_t>(version, 3)));
+                    self->CreateDataDevice();
                 }
             },
             .global_remove = [](void* data,
@@ -839,6 +982,176 @@ namespace rwin
             }
         };
 
+        _dataOfferListener = {
+            .offer = [](void* data, struct wl_data_offer* offer, const char* mimeType)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (const auto found = self->FindDataOffer(offer))
+                {
+                    found->mimeTypes.emplace_back(mimeType);
+                }
+            },
+            .source_actions = [](void* data, struct wl_data_offer* offer, uint32_t sourceActions)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (const auto found = self->FindDataOffer(offer))
+                {
+                    found->sourceActions = sourceActions;
+                }
+            },
+            .action = [](void* data, struct wl_data_offer* offer, uint32_t dndAction)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (const auto found = self->FindDataOffer(offer))
+                {
+                    found->action = dndAction;
+                }
+            },
+        };
+
+        _dataDeviceListener = {
+            .data_offer = [](void* data, struct wl_data_device* device, struct wl_data_offer* offer)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                auto dataOffer = std::make_unique<DataOffer>();
+                dataOffer->offer = offer;
+                self->_dataOffers.insert_or_assign(offer, std::move(dataOffer));
+                wl_data_offer_add_listener(offer, &self->_dataOfferListener, self);
+            },
+            .enter = [](void* data, struct wl_data_device* device, uint32_t serial, struct wl_surface* surface,
+                        wl_fixed_t x, wl_fixed_t y, struct wl_data_offer* offer)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                self->_dragOffer = offer;
+                self->_dragSerial = serial;
+                self->_dragWindow = UINT64_NULL_HANDLE;
+                self->_dragEnterEffect = DropEffect::None;
+
+                const auto info = self->GetWindowInfo(surface);
+                const auto dataOffer = self->FindDataOffer(offer);
+                if (!info || !dataOffer)
+                {
+                    return;
+                }
+
+                self->_dragWindow = info->windowId;
+                self->_dragPosition = {
+                    static_cast<float>(wl_fixed_to_double(x)) * static_cast<float>(info->scale),
+                    static_cast<float>(wl_fixed_to_double(y)) * static_cast<float>(info->scale),
+                };
+                self->_dragEnterEffect = DispatchDropEnter(GetDropCallbacks(info), self->MakeDropInfo(*dataOffer),
+                                                           WaylandDataView{self->_display, dataOffer});
+                self->ApplyDragEffect(self->_dragEnterEffect);
+            },
+            .leave = [](void* data, struct wl_data_device* device)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (const auto info = self->GetWindowInfo(self->_dragWindow))
+                {
+                    DispatchDropLeave(GetDropCallbacks(info));
+                }
+                self->EndDrag();
+            },
+            .motion = [](void* data, struct wl_data_device* device, uint32_t time, wl_fixed_t x, wl_fixed_t y)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                const auto info = self->GetWindowInfo(self->_dragWindow);
+                const auto dataOffer = self->FindDataOffer(self->_dragOffer);
+                if (!info || !dataOffer)
+                {
+                    return;
+                }
+
+                self->_dragPosition = {
+                    static_cast<float>(wl_fixed_to_double(x)) * static_cast<float>(info->scale),
+                    static_cast<float>(wl_fixed_to_double(y)) * static_cast<float>(info->scale),
+                };
+                const auto effect = DispatchDropOver(GetDropCallbacks(info), self->MakeDropInfo(*dataOffer),
+                                                     WaylandDataView{self->_display, dataOffer},
+                                                     self->_dragEnterEffect);
+                if (effect != self->_dragEffect)
+                {
+                    self->ApplyDragEffect(effect);
+                }
+            },
+            .drop = [](void* data, struct wl_data_device* device)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                const auto info = self->GetWindowInfo(self->_dragWindow);
+                const auto dataOffer = self->FindDataOffer(self->_dragOffer);
+                auto effect = DropEffect::None;
+                if (info && dataOffer)
+                {
+                    effect = DispatchDrop(GetDropCallbacks(info), self->MakeDropInfo(*dataOffer),
+                                          WaylandDataView{self->_display, dataOffer});
+                }
+
+                // finish is a protocol error unless a type was accepted and an action was agreed.
+                if (dataOffer && effect != DropEffect::None && self->_dragAccepted && dataOffer->action != 0 &&
+                    wl_data_offer_get_version(dataOffer->offer) >= WL_DATA_OFFER_FINISH_SINCE_VERSION)
+                {
+                    wl_data_offer_finish(dataOffer->offer);
+                }
+                self->EndDrag();
+            },
+            .selection = [](void* data, struct wl_data_device* device, struct wl_data_offer* offer)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (self->_selectionOffer && self->_selectionOffer != offer)
+                {
+                    self->DestroyDataOffer(self->_selectionOffer);
+                }
+                self->_selectionOffer = offer;
+            },
+        };
+
+        _dataSourceListener = {
+            .target = [](void* data, struct wl_data_source* source, const char* mimeType)
+            {
+            },
+            .send = [](void* data, struct wl_data_source* source, const char* mimeType, int32_t fd)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                if (source == self->_clipboardSource)
+                {
+                    std::string_view remaining{self->_clipboardText};
+                    while (!remaining.empty())
+                    {
+                        const auto written = write(fd, remaining.data(), remaining.size());
+                        if (written < 0 && errno == EINTR)
+                        {
+                            continue;
+                        }
+                        if (written <= 0)
+                        {
+                            break;
+                        }
+                        remaining.remove_prefix(static_cast<std::size_t>(written));
+                    }
+                }
+                close(fd);
+            },
+            .cancelled = [](void* data, struct wl_data_source* source)
+            {
+                const auto self = static_cast<WaylandWindowManager*>(data);
+                wl_data_source_destroy(source);
+                if (source == self->_clipboardSource)
+                {
+                    self->_clipboardSource = nullptr;
+                    self->_clipboardText.clear();
+                }
+            },
+            .dnd_drop_performed = [](void* data, struct wl_data_source* source)
+            {
+            },
+            .dnd_finished = [](void* data, struct wl_data_source* source)
+            {
+            },
+            .action = [](void* data, struct wl_data_source* source, uint32_t dndAction)
+            {
+            },
+        };
+
         _xkbContext = xkb_context_new(static_cast<xkb_context_flags>(0));
         _display = wl_display_connect(nullptr);
         if (!_display)
@@ -873,6 +1186,14 @@ namespace rwin
             Destroy(id);
         }
 
+        for (const auto& offer : _dataOffers)
+        {
+            wl_data_offer_destroy(offer.first);
+        }
+        _dataOffers.clear();
+        if (_clipboardSource) wl_data_source_destroy(_clipboardSource);
+        if (_dataDevice) wl_data_device_destroy(_dataDevice);
+        if (_dataDeviceManager) wl_data_device_manager_destroy(_dataDeviceManager);
         if (_keyboard) wl_keyboard_release(_keyboard);
         if (_pointer) wl_pointer_release(_pointer);
         if (_seat) wl_seat_release(_seat);
@@ -967,6 +1288,11 @@ namespace rwin
         {
             _keyboardFocusedHandle = UINT64_NULL_HANDLE;
             _repeatKeycode = 0;
+        }
+
+        if (id == _dragWindow)
+        {
+            _dragWindow = UINT64_NULL_HANDLE;
         }
 
         const auto found = _windows.find(id);
@@ -1113,7 +1439,8 @@ namespace rwin
                 .windowId = info->windowId,
                 .position = info->cursorPosition,
                 .delta = Vector2{
-                    convert(_scrollContinuous.x, _scrollDiscrete120.x),
+                    // Positive x scrolls left, matching the other backends.
+                    -convert(_scrollContinuous.x, _scrollDiscrete120.x),
                     -convert(_scrollContinuous.y, _scrollDiscrete120.y),
                 },
             };
@@ -1242,7 +1569,7 @@ namespace rwin
             return;
         }
 
-        const auto text = utf8ToUtf16(std::string_view{utf8, static_cast<std::size_t>(length)});
+        const auto text = Utf8ToUtf16(std::string_view{utf8, static_cast<std::size_t>(length)});
         if (text.empty())
         {
             return;
@@ -1365,10 +1692,183 @@ namespace rwin
 
     void WaylandWindowManager::SetDropCallbacks(const std::uint64_t& id, const DropCallbacks& callbacks)
     {
+        if (const auto info = GetWindowInfo(id))
+        {
+            info->dropCallbacks = callbacks;
+        }
     }
 
     void WaylandWindowManager::ClearDropCallbacks(const std::uint64_t& id)
     {
+        if (const auto info = GetWindowInfo(id))
+        {
+            info->dropCallbacks = {};
+        }
+    }
+
+    void WaylandWindowManager::CreateDataDevice()
+    {
+        if (!_dataDeviceManager || !_seat || _dataDevice)
+        {
+            return;
+        }
+        _dataDevice = wl_data_device_manager_get_data_device(_dataDeviceManager, _seat);
+        wl_data_device_add_listener(_dataDevice, &_dataDeviceListener, this);
+    }
+
+    DataOffer* WaylandWindowManager::FindDataOffer(wl_data_offer* offer)
+    {
+        if (const auto found = _dataOffers.find(offer); found != _dataOffers.end())
+        {
+            return found->second.get();
+        }
+        return nullptr;
+    }
+
+    void WaylandWindowManager::DestroyDataOffer(wl_data_offer* offer)
+    {
+        if (_dataOffers.erase(offer) > 0)
+        {
+            wl_data_offer_destroy(offer);
+        }
+        if (offer == _selectionOffer)
+        {
+            _selectionOffer = nullptr;
+        }
+    }
+
+    DropInfo WaylandWindowManager::MakeDropInfo(const DataOffer& offer)
+    {
+        Flags<DropEffect> allowed{};
+        // Sources older than version 3, or ones that have not announced yet, report no actions.
+        if (offer.sourceActions == 0 || (offer.sourceActions & WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY))
+        {
+            allowed.Add(DropEffect::Copy);
+        }
+        if (offer.sourceActions == 0 || (offer.sourceActions & WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE))
+        {
+            allowed.Add(DropEffect::Move);
+        }
+
+        return DropInfo{
+            .position = _dragPosition,
+            .allowed = allowed,
+            .modifiers = CurrentModifiers(),
+        };
+    }
+
+    void WaylandWindowManager::ApplyDragEffect(const DropEffect effect)
+    {
+        const auto dataOffer = FindDataOffer(_dragOffer);
+        if (!dataOffer)
+        {
+            return;
+        }
+
+        const char* mimeType = nullptr;
+        if (effect != DropEffect::None)
+        {
+            mimeType = FindMimeType(*dataOffer, {&URI_LIST_MIME_TYPE, 1});
+            if (!mimeType)
+            {
+                mimeType = FindMimeType(*dataOffer, TEXT_MIME_TYPES);
+            }
+        }
+
+        wl_data_offer_accept(dataOffer->offer, _dragSerial, mimeType);
+        _dragAccepted = mimeType != nullptr;
+        _dragEffect = _dragAccepted ? effect : DropEffect::None;
+
+        if (wl_data_offer_get_version(dataOffer->offer) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
+        {
+            std::uint32_t action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+            if (_dragAccepted)
+            {
+                action = effect == DropEffect::Move
+                             ? WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE
+                             : WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+            }
+            wl_data_offer_set_actions(dataOffer->offer, action, action);
+        }
+    }
+
+    void WaylandWindowManager::EndDrag()
+    {
+        if (_dragOffer)
+        {
+            DestroyDataOffer(_dragOffer);
+        }
+        _dragOffer = nullptr;
+        _dragWindow = UINT64_NULL_HANDLE;
+        _dragAccepted = false;
+        _dragEffect = DropEffect::None;
+        _dragEnterEffect = DropEffect::None;
+    }
+
+    bool WaylandWindowManager::HasClipboardText()
+    {
+        if (_clipboardSource)
+        {
+            return !_clipboardText.empty();
+        }
+        const auto offer = FindDataOffer(_selectionOffer);
+        return offer && FindMimeType(*offer, TEXT_MIME_TYPES) != nullptr;
+    }
+
+    bool WaylandWindowManager::GetClipboardText(std::u16string& out)
+    {
+        // Reading our own offer through a pipe would wait on ourselves.
+        if (_clipboardSource)
+        {
+            if (_clipboardText.empty())
+            {
+                return false;
+            }
+            out = Utf8ToUtf16(_clipboardText);
+            return true;
+        }
+
+        const auto offer = FindDataOffer(_selectionOffer);
+        return offer && WaylandDataView{_display, offer}.GetText(out);
+    }
+
+    bool WaylandWindowManager::SetClipboardText(const std::u16string_view text)
+    {
+        // The compositor only accepts a selection tied to a recent input event.
+        if (!_dataDeviceManager || !_dataDevice || _lastInputSerial == 0)
+        {
+            return false;
+        }
+
+        if (_clipboardSource)
+        {
+            wl_data_source_destroy(_clipboardSource);
+        }
+        _clipboardText = Utf16ToUtf8(text);
+        _clipboardSource = wl_data_device_manager_create_data_source(_dataDeviceManager);
+        wl_data_source_add_listener(_clipboardSource, &_dataSourceListener, this);
+        for (const auto mimeType : TEXT_MIME_TYPES)
+        {
+            wl_data_source_offer(_clipboardSource, mimeType);
+        }
+        wl_data_device_set_selection(_dataDevice, _clipboardSource, _lastInputSerial);
+        wl_display_flush(_display);
+        return true;
+    }
+
+    void WaylandWindowManager::ClearClipboard()
+    {
+        if (_clipboardSource)
+        {
+            wl_data_source_destroy(_clipboardSource);
+            _clipboardSource = nullptr;
+            _clipboardText.clear();
+        }
+        if (_dataDevice && _lastInputSerial != 0)
+        {
+            wl_data_device_set_selection(_dataDevice, nullptr, _lastInputSerial);
+            wl_display_flush(_display);
+        }
     }
 
     WindowInfo* WaylandWindowManager::GetWindowInfo(const std::uint64_t& id)

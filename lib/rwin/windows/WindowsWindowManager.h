@@ -62,12 +62,17 @@ namespace rwin
         void StopTextInput(const std::uint64_t& id) override;
         void SetTextInputRect(const std::uint64_t& id, const Rect2D& caret) override;
         std::u16string_view GetEventText(const TextRef& ref) override;
+        bool HasClipboardText() override;
+        bool GetClipboardText(std::u16string& out) override;
+        bool SetClipboardText(std::u16string_view text) override;
+        void ClearClipboard() override;
         TextArena textArena{};
 
     private:
         std::unordered_map<std::uint64_t, WindowInfo> _windows;
         std::unordered_map<HWND,std::uint64_t> _hwndToWindowId;
         IdFactory _idFactory{};
+        HWND _clipboardOwner{nullptr}; // message-only window, so the clipboard works with no windows open
     };
 }
 #endif

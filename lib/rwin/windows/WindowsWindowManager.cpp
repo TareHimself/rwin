@@ -19,13 +19,14 @@
 #include <windowsx.h>
 #include <imm.h>
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vulkan_win32.h>
 #include <atlbase.h>
 #include <atlcom.h>
 
-#include "rwin/IDropContext.h"
+#include "../DropDispatch.h"
 #pragma comment (lib, "Dwmapi")
 #pragma comment (lib, "imm32")
 namespace rwin
@@ -37,19 +38,25 @@ namespace rwin
     constexpr int KEY_DOWN_MASK = 0x8000;
 
 
-    struct DropContext : IDropContext
+    struct DataObjectView final : IDataView
     {
-        bool HasFiles() override
+        explicit DataObjectView(IDataObject* dataObject) : _dataObject(dataObject)
         {
-            return _hasFiles;
-        }
-        bool HasText() override
-        {
-            return _hasText;
         }
 
-        bool GetFiles(std::vector<std::filesystem::path>& paths) override
+        bool HasFiles() const override
         {
+            return Has(CF_HDROP);
+        }
+        bool HasText() const override
+        {
+            return Has(CF_UNICODETEXT) || Has(CF_TEXT);
+        }
+
+        bool GetFiles(std::vector<std::filesystem::path>& paths) const override
+        {
+            if (!_dataObject) return false;
+
             FORMATETC formatEtc = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
             STGMEDIUM stgMedium;
 
@@ -61,9 +68,11 @@ namespace rwin
                     const auto fileCount = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
                     for (UINT i = 0; i < fileCount; ++i)
                     {
-                        wchar_t filePath[MAX_PATH];
-                        if (DragQueryFileW(hDrop, i, filePath, MAX_PATH))
+                        const auto length = DragQueryFileW(hDrop, i, nullptr, 0);
+                        std::wstring filePath(length + 1, L'\0');
+                        if (DragQueryFileW(hDrop, i, filePath.data(), length + 1))
                         {
+                            filePath.resize(length);
                             paths.emplace_back(filePath);
                         }
                     }
@@ -78,7 +87,7 @@ namespace rwin
             return false;
         }
 
-        bool GetText(std::vector<std::string>& text) override
+        bool GetText(std::u16string& out) const override
         {
             if (!_dataObject) return false;
 
@@ -96,72 +105,51 @@ namespace rwin
             bool success = false;
             if (stg.tymed == TYMED_HGLOBAL && stg.hGlobal)
             {
-                const void* data = GlobalLock(stg.hGlobal);
-                if (data)
+                if (const void* data = GlobalLock(stg.hGlobal))
                 {
-                    std::string output;
-
+                    const auto bytes = GlobalSize(stg.hGlobal);
                     if (fmt.cfFormat == CF_UNICODETEXT)
                     {
-                        const wchar_t* wtext = static_cast<const wchar_t*>(data);
-                        int len = WideCharToMultiByte(CP_UTF8, 0, wtext, -1, nullptr, 0, nullptr, nullptr);
-                        if (len > 0)
-                        {
-                            output.resize(len - 1); // exclude null terminator
-                            WideCharToMultiByte(CP_UTF8, 0, wtext, -1, output.data(), len, nullptr, nullptr);
-                        }
+                        static_assert(sizeof(wchar_t) == sizeof(char16_t));
+                        const auto chars = static_cast<const char16_t*>(data);
+                        out.assign(chars, std::find(chars, chars + bytes / sizeof(char16_t), u'\0'));
                     }
                     else // CF_TEXT
                     {
-                        const char* ctext = static_cast<const char*>(data);
-                        output = std::string(ctext);
+                        const auto chars = static_cast<const char*>(data);
+                        const auto length = static_cast<int>(std::find(chars, chars + bytes, '\0') - chars);
+                        const auto wideLength = MultiByteToWideChar(CP_ACP, 0, chars, length, nullptr, 0);
+                        out.assign(static_cast<std::size_t>((std::max)(wideLength, 0)), u'\0');
+                        if (wideLength > 0)
+                        {
+                            MultiByteToWideChar(CP_ACP, 0, chars, length, reinterpret_cast<wchar_t*>(out.data()),
+                                                wideLength);
+                        }
                     }
 
                     GlobalUnlock(stg.hGlobal);
-
-                    // Split lines and push
-                    std::istringstream iss(output);
-                    std::string line;
-                    while (std::getline(iss, line))
-                    {
-                        if (!line.empty())
-                        {
-                            text.emplace_back(line);
-                            success = true;
-                        }
-                    }
+                    success = true;
                 }
             }
 
             ReleaseStgMedium(&stg);
             return success;
         }
-        explicit DropContext(IDataObject* dataObject)
-        {
-            _dataObject = dataObject;
-            CComPtr<IEnumFORMATETC> enumFormat;
-            if (FAILED(dataObject->EnumFormatEtc(DATADIR_GET, &enumFormat))) return;
-
-            FORMATETC fmt;
-            while (enumFormat->Next(1, &fmt, nullptr) == S_OK) {
-
-                if (fmt.cfFormat == CF_HDROP) {
-                    _hasFiles = true;
-                } else if (fmt.cfFormat == CF_UNICODETEXT || fmt.cfFormat == CF_TEXT) {
-                    _hasText = true;
-                }
-                // else if (fmt.cfFormat == CF_BITMAP || fmt.cfFormat == CF_DIB || fmt.cfFormat == CF_DIBV5) {
-                //     flags.Add(DndFormatFlags::Image);
-                // }
-            }
-        }
 
     private:
+        bool Has(const CLIPFORMAT format) const
+        {
+            FORMATETC formatEtc = { format, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            return _dataObject && _dataObject->QueryGetData(&formatEtc) == S_OK;
+        }
 
-        bool _hasFiles{false};
-        bool _hasText{false};
-        IDataObject* _dataObject{};
+        CComPtr<IDataObject> _dataObject{};
     };
+
+    static_assert(DROPEFFECT_COPY == static_cast<DWORD>(DropEffect::Copy) &&
+        DROPEFFECT_MOVE == static_cast<DWORD>(DropEffect::Move) &&
+        DROPEFFECT_LINK == static_cast<DWORD>(DropEffect::Link));
+
     class WindowDropTarget final : public IDropTarget
     {
     public:
@@ -200,69 +188,97 @@ namespace rwin
 
         [[nodiscard]] WindowInfo * GetWindowInfo() const
         {
-            return MANAGER_INSTANCE->GetWindowInfo(_windowId);
+            return MANAGER_INSTANCE ? MANAGER_INSTANCE->GetWindowInfo(_windowId) : nullptr;
         }
 
-        static Vector2 GetClientPosition(WindowInfo * info,POINTL pt)
+        static const DropCallbacks* GetCallbacks(const WindowInfo* info)
+        {
+            return info->dropCallbacks.has_value() ? &*info->dropCallbacks : nullptr;
+        }
+
+        static DropInfo MakeDropInfo(const WindowInfo* info, const DWORD keyState, const POINTL pt, const DWORD allowed)
         {
             POINT point{pt.x,pt.y};
             ScreenToClient(info->hwnd,&point);
-            return Vector2(point.x,point.y);
+
+            Flags<InputModifier> modifiers{};
+            if (keyState & MK_SHIFT) modifiers.Add(InputModifier::Shift);
+            if (keyState & MK_CONTROL) modifiers.Add(InputModifier::Control);
+            if (keyState & MK_ALT) modifiers.Add(InputModifier::Alt);
+
+            return DropInfo{
+                .position = Vector2{static_cast<float>(point.x), static_cast<float>(point.y)},
+                .allowed = Flags<DropEffect>(static_cast<std::uint32_t>(
+                    allowed & (DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK))),
+                .modifiers = modifiers,
+            };
         }
 
         HRESULT DragEnter(IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect) override
         {
-            bool accept = false;
+            _data = std::make_unique<DataObjectView>(pDataObj);
+            _enterEffect = DropEffect::None;
             if (const auto info = GetWindowInfo())
             {
-                const auto ctx = std::make_shared<DropContext>(pDataObj);
-                accept = info->dropCallbacks.has_value() && info->dropCallbacks->enter(GetClientPosition(info,pt),ctx.get());
-                if (accept)
-                {
-                    _dropContext = ctx;
-                }
+                _enterEffect = DispatchDropEnter(GetCallbacks(info), MakeDropInfo(info, grfKeyState, pt, *pdwEffect),
+                                                 *_data);
             }
-            *pdwEffect = accept ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            *pdwEffect = static_cast<DWORD>(_enterEffect);
             return S_OK;
         }
         HRESULT DragOver(DWORD grfKeyState, POINTL pt, DWORD* pdwEffect) override
         {
-            bool accept = false;
-            if (const auto info = GetWindowInfo(); info && _dropContext)
+            auto effect = DropEffect::None;
+            if (const auto info = GetWindowInfo(); info && _data)
             {
-                accept = info->dropCallbacks.has_value() && info->dropCallbacks->over(GetClientPosition(info,pt),_dropContext.get());
+                effect = DispatchDropOver(GetCallbacks(info), MakeDropInfo(info, grfKeyState, pt, *pdwEffect), *_data,
+                                          _enterEffect);
             }
-            *pdwEffect = accept ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+            *pdwEffect = static_cast<DWORD>(effect);
             return S_OK;
         }
         HRESULT DragLeave() override
         {
-            if (const auto info = GetWindowInfo(); info && _dropContext)
+            if (const auto info = GetWindowInfo(); info && _data)
             {
-                if (info->dropCallbacks.has_value())
-                {
-                    info->dropCallbacks->leave();
-                }
+                DispatchDropLeave(GetCallbacks(info));
             }
+            _data.reset();
             return S_OK;
         }
         HRESULT Drop(IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect) override
         {
-            if (const auto info = GetWindowInfo(); info && _dropContext)
+            auto effect = DropEffect::None;
+            if (const auto info = GetWindowInfo(); info && _data)
             {
-                if (info->dropCallbacks.has_value())
-                {
-                    info->dropCallbacks->drop(GetClientPosition(info,pt),_dropContext.get());
-                }
+                effect = DispatchDrop(GetCallbacks(info), MakeDropInfo(info, grfKeyState, pt, *pdwEffect), *_data);
             }
+            _data.reset();
+            *pdwEffect = static_cast<DWORD>(effect);
             return S_OK;
         }
 
     private:
         ULONG _refCount;
         std::uint64_t _windowId;
-        std::shared_ptr<DropContext> _dropContext;
+        std::unique_ptr<DataObjectView> _data;
+        DropEffect _enterEffect{DropEffect::None};
     };
+
+    bool OpenClipboardWithRetry(const HWND owner)
+    {
+        // Another process may hold the clipboard open for a moment.
+        for (int attempt = 0; attempt < 5; ++attempt)
+        {
+            if (OpenClipboard(owner))
+            {
+                return true;
+            }
+            Sleep(5);
+        }
+        return false;
+    }
+
     InputKey MapVirtualKeyToInputKey(UINT vk, LPARAM lParam)
     {
         // Extended key flag from lParam
@@ -388,7 +404,7 @@ namespace rwin
         case VK_RWIN: return InputKey::RightSuper;
         case VK_APPS: return InputKey::Menu;
 
-        default: return InputKey::A; // Fallback or unknown
+        default: return InputKey::Unknown;
         }
     }
 
@@ -573,7 +589,8 @@ namespace rwin
                     .type = WindowEventType::Scroll,
                     .windowId = windowInfo->id,
                     .position = Vector2{static_cast<float>(point.x), static_cast<float>(point.y)},
-                    .delta = Vector2{horizontal ? pixels : 0.0f, horizontal ? 0.0f : pixels},
+                    // Positive x scrolls left, matching the other backends.
+                    .delta = Vector2{horizontal ? -pixels : 0.0f, horizontal ? 0.0f : pixels},
                 };
                 MANAGER_INSTANCE->pendingEvents.push_back(ev);
                 return 0;
@@ -937,8 +954,9 @@ namespace rwin
                     .windowId = windowInfo->id,
                     .size = MANAGER_INSTANCE->GetClientSize(windowInfo->id)
                 };
-                if (!MANAGER_INSTANCE->pendingEvents.empty() && MANAGER_INSTANCE->pendingEvents.back().info.type ==
-                    WindowEventType::Resize)
+                if (!MANAGER_INSTANCE->pendingEvents.empty() &&
+                    MANAGER_INSTANCE->pendingEvents.back().info.type == WindowEventType::Resize &&
+                    MANAGER_INSTANCE->pendingEvents.back().info.windowId == windowInfo->id)
                 {
                     MANAGER_INSTANCE->pendingEvents.back() = ev;
                 }
@@ -980,6 +998,8 @@ namespace rwin
             wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
             RegisterClassW(&wc);
         }
+        _clipboardOwner = CreateWindowExW(0, DEFAULT_WINDOW_CLASS_NAME, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
+                                          INSTANCE, nullptr);
         MANAGER_INSTANCE = this;
     }
 
@@ -996,6 +1016,10 @@ namespace rwin
             Destroy(id);
         }
 
+        if (_clipboardOwner)
+        {
+            DestroyWindow(_clipboardOwner);
+        }
         UnregisterClassW(DEFAULT_WINDOW_CLASS_NAME, INSTANCE);
         MANAGER_INSTANCE = nullptr;
         OleUninitialize();
@@ -1041,7 +1065,6 @@ namespace rwin
     std::uint64_t WindowsWindowManager::Create(const std::string_view& title, const Extent2D& size,
                                                const Flags<WindowFlags>& flags)
     {
-        auto windowId = _idFactory.New();
         auto windowFlags = WS_SYSMENU;
 
         if (flags.Has(WindowFlags::Resizable))
@@ -1075,7 +1098,7 @@ namespace rwin
         }
 
         const auto hwnd = CreateWindowExW(
-            0,
+            flags.Has(WindowFlags::Floating) ? WS_EX_TOPMOST : 0,
             DEFAULT_WINDOW_CLASS_NAME,
             wideTitle.c_str(),
             windowFlags,
@@ -1089,28 +1112,44 @@ namespace rwin
             nullptr
         );
 
-        if (flags.Has(WindowFlags::Focused))
+        if (!hwnd)
         {
-            SetFocus(hwnd);
+            return 0;
         }
+
+        const auto windowId = _idFactory.New();
         {
             auto pref = DWMWCP_ROUND;
             DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
         }
 
-        ImmAssociateContext(hwnd, nullptr);
-
-        ShowWindow(hwnd, flags.Has(WindowFlags::Visible) ? SW_SHOW : SW_HIDE);
-
-        IDropTarget * dropTarget = nullptr;
-        if (flags.Has(WindowFlags::DragAndDrop))
+        if (flags.Has(WindowFlags::Transparent))
         {
-            dropTarget = new WindowDropTarget(windowId);
-            RegisterDragDrop(hwnd, dropTarget);
+            // An empty blur region makes DWM composite the window using its alpha channel.
+            const auto region = CreateRectRgn(0, 0, -1, -1);
+            const DWM_BLURBEHIND blur{
+                .dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION,
+                .fEnable = TRUE,
+                .hRgnBlur = region,
+            };
+            DwmEnableBlurBehindWindow(hwnd, &blur);
+            DeleteObject(region);
         }
 
-        _windows.emplace(windowId, WindowInfo{.id = windowId, .hwnd = hwnd, .dropTarget = dropTarget});
+        ImmAssociateContext(hwnd, nullptr);
+
+        // Registered before showing so the first focus and resize events are not dropped.
+        _windows.emplace(windowId, WindowInfo{.id = windowId, .hwnd = hwnd});
         _hwndToWindowId.emplace(hwnd, windowId);
+
+        if (flags.Has(WindowFlags::Visible))
+        {
+            ShowWindow(hwnd, SW_SHOW);
+            if (flags.Has(WindowFlags::Focused))
+            {
+                SetFocus(hwnd);
+            }
+        }
         return windowId;
     }
 
@@ -1131,6 +1170,7 @@ namespace rwin
             _hwndToWindowId.erase(hwnd);
             _windows.erase(info);
             std::erase_if(pendingEvents, [&id](const WindowEvent& event) { return event.info.windowId == id; });
+            _idFactory.Free(id);
         }
     }
 
@@ -1350,6 +1390,15 @@ namespace rwin
         if (const auto info = GetWindowInfo(id))
         {
             info->dropCallbacks = callbacks;
+            if (info->dropTarget == nullptr)
+            {
+                info->dropTarget = new WindowDropTarget(id);
+                if (FAILED(RegisterDragDrop(info->hwnd, info->dropTarget)))
+                {
+                    info->dropTarget->Release();
+                    info->dropTarget = nullptr;
+                }
+            }
         }
     }
 
@@ -1358,6 +1407,67 @@ namespace rwin
         if (const auto info = GetWindowInfo(id))
         {
             info->dropCallbacks = {};
+            if (info->dropTarget != nullptr)
+            {
+                RevokeDragDrop(info->hwnd);
+                info->dropTarget->Release();
+                info->dropTarget = nullptr;
+            }
+        }
+    }
+
+    bool WindowsWindowManager::HasClipboardText()
+    {
+        return IsClipboardFormatAvailable(CF_UNICODETEXT) != 0;
+    }
+
+    bool WindowsWindowManager::GetClipboardText(std::u16string& out)
+    {
+        CComPtr<IDataObject> dataObject;
+        for (int attempt = 0; attempt < 5 && !dataObject; ++attempt)
+        {
+            if (FAILED(OleGetClipboard(&dataObject)))
+            {
+                Sleep(5);
+            }
+        }
+        return dataObject && DataObjectView(dataObject).GetText(out);
+    }
+
+    bool WindowsWindowManager::SetClipboardText(const std::u16string_view text)
+    {
+        if (!OpenClipboardWithRetry(_clipboardOwner))
+        {
+            return false;
+        }
+
+        bool success = false;
+        EmptyClipboard();
+        if (const auto handle = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(char16_t)))
+        {
+            if (const auto memory = static_cast<char16_t*>(GlobalLock(handle)))
+            {
+                std::copy(text.begin(), text.end(), memory);
+                memory[text.size()] = u'\0';
+                GlobalUnlock(handle);
+                // The clipboard owns the handle once this succeeds.
+                success = SetClipboardData(CF_UNICODETEXT, handle) != nullptr;
+            }
+            if (!success)
+            {
+                GlobalFree(handle);
+            }
+        }
+        CloseClipboard();
+        return success;
+    }
+
+    void WindowsWindowManager::ClearClipboard()
+    {
+        if (OpenClipboardWithRetry(_clipboardOwner))
+        {
+            EmptyClipboard();
+            CloseClipboard();
         }
     }
 }

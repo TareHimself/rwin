@@ -6,6 +6,12 @@
 #include <wayland-client-protocol.h>
 #include <wayland-cursor.h>
 #include <chrono>
+#include <list>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <libdecor.h>
 #include <unordered_set>
 #include <xdg-shell-client-protocol.h>
@@ -32,6 +38,15 @@ namespace rwin
         Vector2 cursorPosition{};
         std::optional<DropCallbacks> dropCallbacks{};
         std::optional<std::function<HitTestResult(const Vector2&)>> hitTestFunction{};
+    };
+
+    // What another client is offering, for the clipboard or for a drag.
+    struct DataOffer
+    {
+        wl_data_offer* offer{nullptr};
+        std::vector<std::string> mimeTypes{};
+        std::uint32_t sourceActions{0};
+        std::uint32_t action{0};
     };
 
     struct KeyboardInfo {
@@ -72,6 +87,10 @@ namespace rwin
         void StartTextInput(const std::uint64_t& id, const Rect2D& caret) override;
         void StopTextInput(const std::uint64_t& id) override;
         std::u16string_view GetEventText(const TextRef& ref) override;
+        bool HasClipboardText() override;
+        bool GetClipboardText(std::u16string& out) override;
+        bool SetClipboardText(std::u16string_view text) override;
+        void ClearClipboard() override;
     private:
         std::unordered_map<std::uint64_t,std::shared_ptr<WindowInfo>> _windows{};
         std::unordered_map<wl_surface*,std::shared_ptr<WindowInfo>> _surfaceToWindows{};
@@ -101,6 +120,30 @@ namespace rwin
         libdecor_frame_interface _frameInterface{};
         wl_surface_listener _surfaceListener{};
         wl_output_listener _outputListener{};
+        wl_data_device_manager * _dataDeviceManager = nullptr;
+        wl_data_device * _dataDevice = nullptr;
+        wl_data_device_listener _dataDeviceListener{};
+        wl_data_offer_listener _dataOfferListener{};
+        wl_data_source_listener _dataSourceListener{};
+        std::unordered_map<wl_data_offer*, std::unique_ptr<DataOffer>> _dataOffers{};
+        wl_data_offer * _selectionOffer = nullptr;
+        wl_data_offer * _dragOffer = nullptr;
+        std::uint64_t _dragWindow = std::numeric_limits<std::uint64_t>::max();
+        std::uint32_t _dragSerial = 0;
+        Vector2 _dragPosition{};
+        DropEffect _dragEnterEffect{DropEffect::None};
+        DropEffect _dragEffect{DropEffect::None};
+        bool _dragAccepted = false;
+        // Set while this process owns the clipboard; the text is served from here on request.
+        wl_data_source * _clipboardSource = nullptr;
+        std::string _clipboardText{};
+        std::uint32_t _lastInputSerial = 0;
+        void CreateDataDevice();
+        DataOffer* FindDataOffer(wl_data_offer* offer);
+        void DestroyDataOffer(wl_data_offer* offer);
+        DropInfo MakeDropInfo(const DataOffer& offer);
+        void ApplyDragEffect(DropEffect effect);
+        void EndDrag();
         std::unordered_map<wl_output*, std::int32_t> _outputScales{};
         bool _hasPreferredBufferScale = false;
         bool _pointerHasFrame = false;

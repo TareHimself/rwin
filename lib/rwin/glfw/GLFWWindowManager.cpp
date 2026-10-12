@@ -14,6 +14,8 @@
 
 #include "rwin/IdFactory.h"
 #include "../TextArena.h"
+#include "../DropDispatch.h"
+#include "../Utf.h"
 
 namespace rwin {
     namespace {
@@ -30,6 +32,27 @@ namespace rwin {
 
         WindowInfo* GetWindowInfo(GLFWwindow* window) {
             return static_cast<WindowInfo*>(glfwGetWindowUserPointer(window));
+        }
+
+        // Cursor coordinates are in window units, but GetClientSize() reports framebuffer pixels.
+        // Scale by the framebuffer/window ratio (1.0 on Windows and X11, 2.0 on Retina); content
+        // scale would wrongly double-scale on Windows where window units are already pixels.
+        Vector2 ToFramebuffer(GLFWwindow* window, double x, double y) {
+            int windowW{};
+            int windowH{};
+            int fbW{};
+            int fbH{};
+            glfwGetWindowSize(window, &windowW, &windowH);
+            glfwGetFramebufferSize(window, &fbW, &fbH);
+            if (windowW > 0 && windowH > 0) {
+                x *= static_cast<double>(fbW) / windowW;
+                y *= static_cast<double>(fbH) / windowH;
+            }
+
+            return Vector2{
+                .x = static_cast<float>(x),
+                .y = static_cast<float>(y),
+            };
         }
 
         InputState ToInputState(const int action) {
@@ -292,10 +315,7 @@ namespace rwin {
                 new (&event.cursorMove) CursorMoveEvent{
                     .type = WindowEventType::CursorMove,
                     .windowId = info->id,
-                    .position = Vector2{
-                        .x = static_cast<float>(x),
-                        .y = static_cast<float>(y),
-                    },
+                    .position = ToFramebuffer(glfwWindow, x, y),
                 };
                 info->events->push_back(event);
             });
@@ -357,17 +377,6 @@ namespace rwin {
                 double y{};
                 glfwGetCursorPos(glfwWindow, &x, &y);
 
-                int windowW{};
-                int windowH{};
-                int fbW{};
-                int fbH{};
-                glfwGetWindowSize(glfwWindow, &windowW, &windowH);
-                glfwGetFramebufferSize(glfwWindow, &fbW, &fbH);
-                if (windowW > 0 && windowH > 0) {
-                    x *= static_cast<double>(fbW) / windowW;
-                    y *= static_cast<double>(fbH) / windowH;
-                }
-
                 float xScale{1.0f};
                 float yScale{1.0f};
                 glfwGetWindowContentScale(glfwWindow, &xScale, &yScale);
@@ -376,10 +385,7 @@ namespace rwin {
                 new (&event.scroll) ScrollEvent{
                     .type = WindowEventType::Scroll,
                     .windowId = info->id,
-                    .position = Vector2{
-                        .x = static_cast<float>(x),
-                        .y = static_cast<float>(y),
-                    },
+                    .position = ToFramebuffer(glfwWindow, x, y),
                     .delta = Vector2{
                         .x = static_cast<float>(xOffset) * SCROLL_DEFAULT_LINES_PER_NOTCH * SCROLL_LINE_PIXELS * xScale,
                         .y = static_cast<float>(yOffset) * SCROLL_DEFAULT_LINES_PER_NOTCH * SCROLL_LINE_PIXELS * yScale,
@@ -388,9 +394,10 @@ namespace rwin {
                 info->events->push_back(event);
             });
 
+            // GLFW only reports the drop itself, and only for files.
             glfwSetDropCallback(window, [](GLFWwindow* glfwWindow, const int count, const char** paths) {
                 const auto info = GetWindowInfo(glfwWindow);
-                if (!info || !info->dropCallbacks.drop) {
+                if (!info) {
                     return;
                 }
 
@@ -398,37 +405,39 @@ namespace rwin {
                 double y{};
                 glfwGetCursorPos(glfwWindow, &x, &y);
 
-                struct GLFWDropContext final : IDropContext {
+                struct GLFWDataView final : IDataView {
                     std::vector<std::filesystem::path> droppedPaths{};
 
-                    bool HasFiles() override {
+                    bool HasFiles() const override {
                         return !droppedPaths.empty();
                     }
 
-                    bool HasText() override {
+                    bool HasText() const override {
                         return false;
                     }
 
-                    bool GetFiles(std::vector<std::filesystem::path>& paths) override {
-                        paths.insert(paths.end(), droppedPaths.begin(), droppedPaths.end());
+                    bool GetFiles(std::vector<std::filesystem::path>& out) const override {
+                        out.insert(out.end(), droppedPaths.begin(), droppedPaths.end());
                         return !droppedPaths.empty();
                     }
 
-                    bool GetText(std::vector<std::string>& text) override {
+                    bool GetText(std::u16string&) const override {
                         return false;
                     }
-                } context{};
+                } data{};
 
                 for (int i = 0; i < count; ++i) {
-                    context.droppedPaths.emplace_back(paths[i]);
+                    data.droppedPaths.emplace_back(Utf8ToUtf16(paths[i]));
                 }
 
-                info->dropCallbacks.drop(
-                    Vector2{
-                        .x = static_cast<float>(x),
-                        .y = static_cast<float>(y),
+                DispatchDrop(
+                    &info->dropCallbacks,
+                    DropInfo{
+                        .position = ToFramebuffer(glfwWindow, x, y),
+                        .allowed = DropEffect::Copy,
+                        .modifiers = {},
                     },
-                    &context
+                    data
                 );
             });
         }
@@ -590,24 +599,7 @@ namespace rwin {
         double y{};
         glfwGetCursorPos(info->window, &x, &y);
 
-        // Cursor coordinates are in window units, but GetClientSize() reports framebuffer pixels.
-        // Scale by the framebuffer/window ratio (1.0 on Windows and X11, 2.0 on Retina); content
-        // scale would wrongly double-scale on Windows where window units are already pixels.
-        int windowW{};
-        int windowH{};
-        int fbW{};
-        int fbH{};
-        glfwGetWindowSize(info->window, &windowW, &windowH);
-        glfwGetFramebufferSize(info->window, &fbW, &fbH);
-        if (windowW > 0 && windowH > 0) {
-            x *= static_cast<double>(fbW) / windowW;
-            y *= static_cast<double>(fbH) / windowH;
-        }
-
-        return Vector2{
-            .x = static_cast<float>(x),
-            .y = static_cast<float>(y),
-        };
+        return ToFramebuffer(info->window, x, y);
     }
 
     void GLFWWindowManager::Show(const std::uint64_t& id) {
@@ -681,20 +673,7 @@ namespace rwin {
     }
 
     float GLFWWindowManager::GetDefaultDpi() {
-        if (!glfwInit()) {
-            return 96.0f;
-        }
-
-        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
-        if (!monitor) {
-            return 96.0f;
-        }
-
-        float xScale{};
-        float yScale{};
-        glfwGetMonitorContentScale(monitor, &xScale, &yScale);
-
-        return 96.0f * ((xScale + yScale) * 0.5f);
+        return 96.0f;
     }
 
     void GLFWWindowManager::PumpEvents() {
@@ -720,6 +699,44 @@ namespace rwin {
 
     std::u16string_view GLFWWindowManager::GetEventText(const TextRef& ref) {
         return _impl->text.View(ref);
+    }
+
+    bool GLFWWindowManager::HasClipboardText() {
+        if (!glfwInit()) {
+            return false;
+        }
+
+        const char* text = glfwGetClipboardString(nullptr);
+        return text && *text;
+    }
+
+    bool GLFWWindowManager::GetClipboardText(std::u16string& out) {
+        if (!glfwInit()) {
+            return false;
+        }
+
+        const char* text = glfwGetClipboardString(nullptr);
+        if (!text || !*text) {
+            return false;
+        }
+
+        out = Utf8ToUtf16(text);
+        return true;
+    }
+
+    bool GLFWWindowManager::SetClipboardText(const std::u16string_view text) {
+        if (!glfwInit()) {
+            return false;
+        }
+
+        glfwSetClipboardString(nullptr, Utf16ToUtf8(text).c_str());
+        return true;
+    }
+
+    void GLFWWindowManager::ClearClipboard() {
+        if (glfwInit()) {
+            glfwSetClipboardString(nullptr, "");
+        }
     }
 
     void GLFWWindowManager::GetRequiredExtensions(std::vector<const char*>& extensions) {

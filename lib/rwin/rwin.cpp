@@ -82,5 +82,21 @@ namespace rwin
         return IWindowManager::Get()->GetEventText(ref);
     }
 
+    bool hasClipboardText(){
+        return IWindowManager::Get()->HasClipboardText();
+    }
+
+    bool getClipboardText(std::u16string& out){
+        return IWindowManager::Get()->GetClipboardText(out);
+    }
+
+    bool setClipboardText(std::u16string_view text){
+        return IWindowManager::Get()->SetClipboardText(text);
+    }
+
+    void clearClipboard(){
+        IWindowManager::Get()->ClearClipboard();
+    }
+
 
 }
