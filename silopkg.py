@@ -1,4 +1,4 @@
-from silo import Component, InvalidConfiguration, Options, Package, SiloPackage
+from silo import Component, Options, Package, SiloPackage
 from silo.enums import Platform
 from silo.tools.cmake import CMakeBuild, CMakeDeps, CMakeGenerator
 from silo.tools.pkgconfig import PkgConfigDeps
@@ -32,10 +32,6 @@ class Rwin(SiloPackage[RwinOptions]):
             self.tool("pkgconf@3")
         self.tool("cmake@4.3")
         self.tool("ninja@1.13")
-
-    def validate(self):
-        if self.profile.settings.os is Platform.Darwin:
-            raise InvalidConfiguration("rwin is not built with silo on macOS yet")
 
     def generate(self):
         deps = CMakeDeps(self)
@@ -80,4 +76,7 @@ class Rwin(SiloPackage[RwinOptions]):
                 "libdecor",
             ]
             library.content.append("share/libdecor/plugins-1")
+        elif self.profile.settings.os is Platform.Darwin and not self.options.shared:
+            # What CMakeLists.txt links for the window manager there
+            library.frameworks += ["AppKit", "Metal", "QuartzCore"]
         return Package(components=[library], licenses=["LICENSE"])
