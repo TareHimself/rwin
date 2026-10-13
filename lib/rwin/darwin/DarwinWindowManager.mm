@@ -602,20 +602,27 @@ namespace {
 // Screen rect of the text caret, which the IME uses to place its candidate popup.
 - (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
     const Rect2D& caret = self.info->caretRect;
-    const NSRect inView = [self convertRectFromBacking:
-        NSMakeRect(caret.offset.x, caret.offset.y, caret.extent.width, caret.extent.height)];
+    const CGFloat scale = self.window.backingScaleFactor;
+    const NSRect inView = NSMakeRect(caret.offset.x / scale, caret.offset.y / scale,
+                                     caret.extent.width / scale, caret.extent.height / scale);
     return [self.window convertRectToScreen:[self convertRect:inView toView:nil]];
 }
 
 // Mouse helpers
 
+// Scaled by hand: convertPointToBacking: answers in the unflipped backing space, which negates y on this flipped view.
+- (NSPoint)toBacking:(NSPoint)inView {
+    const CGFloat scale = self.window.backingScaleFactor;
+    return NSMakePoint(inView.x * scale, inView.y * scale);
+}
+
 // Window-local position in backing pixels, the same unit as resize events and GetClientSize().
 - (NSPoint)localPos:(NSEvent*)event {
-    return [self convertPointToBacking:[self convertPoint:[event locationInWindow] fromView:nil]];
+    return [self toBacking:[self convertPoint:[event locationInWindow] fromView:nil]];
 }
 
 - (NSPoint)dragPos:(id<NSDraggingInfo>)sender {
-    return [self convertPointToBacking:[self convertPoint:[sender draggingLocation] fromView:nil]];
+    return [self toBacking:[self convertPoint:[sender draggingLocation] fromView:nil]];
 }
 
 - (void)pushCursorButton:(NSEvent*)event button:(rwin::CursorButton)btn state:(rwin::InputState)st {
@@ -986,7 +993,7 @@ Vector2 DarwinWindowManager::GetCursorPosition(const std::uint64_t& id) {
     // Window size/resize events report backing-store (physical pixel) extents via
     // convertSizeToBacking: - match that unit here so cursor position lands in the same
     // space as GetSize()/the render extent, instead of points.
-    NSPoint inBacking = [info->view convertPointToBacking:inView];
+    NSPoint inBacking = [info->view toBacking:inView];
     return Vector2{.x = static_cast<float>(inBacking.x), .y = static_cast<float>(inBacking.y)};
 }
 

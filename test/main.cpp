@@ -75,6 +75,15 @@ void createSwapchain(const std::uint64_t& windowId, WindowVulkanInfo& info)
     auto caps = physicalDevice.getSurfaceCapabilitiesKHR(info.surface);
     auto formats = physicalDevice.getSurfaceFormatsKHR(info.surface);
     auto format = formats.front();
+    // ImGui's colors are already sRGB encoded, an sRGB format would encode them a second time
+    for (const auto& candidate : formats)
+    {
+        if (candidate.format == vk::Format::eB8G8R8A8Unorm || candidate.format == vk::Format::eR8G8B8A8Unorm)
+        {
+            format = candidate;
+            break;
+        }
+    }
     vk::SwapchainCreateInfoKHR swapchainCreateInfo{};
     swapchainCreateInfo.setImageFormat(format.format)
                        .setMinImageCount(caps.minImageCount).
