@@ -811,6 +811,12 @@ namespace rwin
                 }
                 return 0;
             }
+        case WM_SYSCHAR:
+            {
+                // Alt+Space still opens the system menu; any other Alt+key beeps in DefWindowProc.
+                if (wParam == VK_SPACE) return DefWindowProcW(hwnd, uMsg, wParam, lParam);
+                return 0;
+            }
         case WM_CHAR:
             {
                 if (!windowInfo->textInputActive)
