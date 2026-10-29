@@ -18,6 +18,10 @@ namespace rwin
     RWIN_API void hideWindow(const std::uint64_t& id);
     RWIN_API void minimizeWindow(const std::uint64_t& id);
     RWIN_API void maximizeWindow(const std::uint64_t& id);
+    // Borderless fullscreen on the window's monitor; no display mode change. The resulting size arrives as a Resize event.
+    RWIN_API void setWindowFullscreen(const std::uint64_t& id, bool fullscreen);
+    // Resizes the client area, in the same units getWindowClientSize reports. The platform may clamp or refuse it.
+    RWIN_API void setWindowSize(const std::uint64_t& id, const Extent2D& size);
     RWIN_API float getWindowDpi(const std::uint64_t& id);
     RWIN_API float getDefaultDpi();
     RWIN_API void pumpEvents();

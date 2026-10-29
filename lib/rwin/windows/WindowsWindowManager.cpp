@@ -1371,6 +1371,51 @@ namespace rwin
         }
     }
 
+    void WindowsWindowManager::SetFullscreen(const std::uint64_t& id, const bool fullscreen)
+    {
+        const auto info = GetWindowInfo(id);
+        if (!info || info->fullscreen == fullscreen)
+        {
+            return;
+        }
+
+        if (fullscreen)
+        {
+            info->windowedStyle = GetWindowLongPtrW(info->hwnd, GWL_STYLE);
+            GetWindowRect(info->hwnd, &info->windowedRect);
+
+            MONITORINFO monitor{.cbSize = sizeof(MONITORINFO)};
+            GetMonitorInfoW(MonitorFromWindow(info->hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
+            const auto& area = monitor.rcMonitor;
+
+            SetWindowLongPtrW(info->hwnd, GWL_STYLE, (info->windowedStyle & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+            SetWindowPos(info->hwnd, HWND_TOP, area.left, area.top, area.right - area.left, area.bottom - area.top,
+                         SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        }
+        else
+        {
+            const auto& rect = info->windowedRect;
+            SetWindowLongPtrW(info->hwnd, GWL_STYLE, info->windowedStyle);
+            SetWindowPos(info->hwnd, nullptr, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                         SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOOWNERZORDER);
+        }
+
+        info->fullscreen = fullscreen;
+    }
+
+    void WindowsWindowManager::SetSize(const std::uint64_t& id, const Extent2D& size)
+    {
+        if (const auto info = GetWindowInfo(id))
+        {
+            const auto style = static_cast<DWORD>(GetWindowLongPtrW(info->hwnd, GWL_STYLE));
+            const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(info->hwnd, GWL_EXSTYLE));
+            RECT frame{0, 0, static_cast<LONG>(size.width), static_cast<LONG>(size.height)};
+            AdjustWindowRectExForDpi(&frame, style, FALSE, exStyle, GetDpiForWindow(info->hwnd));
+            SetWindowPos(info->hwnd, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        }
+    }
+
     float WindowsWindowManager::GetDpi(const std::uint64_t& id)
     {
         if (const auto info = GetWindowInfo(id))

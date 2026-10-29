@@ -1022,6 +1022,26 @@ void DarwinWindowManager::Maximize(const std::uint64_t& id) {
     [info->window zoom:nil];
 }
 
+void DarwinWindowManager::SetFullscreen(const std::uint64_t& id, const bool fullscreen) {
+    auto* info = _impl->Find(id);
+    if (!info) return;
+    const bool isFullscreen = ([info->window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+    if (isFullscreen == fullscreen) return;
+    if (fullscreen) {
+        // Borderless and fixed-size windows are not fullscreen-capable by default.
+        info->window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+    }
+    [info->window toggleFullScreen:nil];
+}
+
+// `size` is in backing pixels like GetClientSize(); setContentSize: wants points.
+void DarwinWindowManager::SetSize(const std::uint64_t& id, const Extent2D& size) {
+    auto* info = _impl->Find(id);
+    if (!info) return;
+    const NSSize backing = NSMakeSize(static_cast<CGFloat>(size.width), static_cast<CGFloat>(size.height));
+    [info->window setContentSize:[info->view convertSizeFromBacking:backing]];
+}
+
 float DarwinWindowManager::GetDpi(const std::uint64_t& id) {
     auto* info = _impl->Find(id);
     if (!info) return GetDefaultDpi();

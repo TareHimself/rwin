@@ -4,6 +4,7 @@
 #include "../ScrollUnits.h"
 #include "GLFWWindowManager.h"
 
+#include <cmath>
 #include <deque>
 #include <memory>
 #include <string>
@@ -26,6 +27,12 @@ namespace rwin {
             std::deque<WindowEvent>* events{};
             TextArena* text{};
             bool textInputActive{false};
+            bool fullscreen{false};
+            // Windowed placement, restored when leaving fullscreen.
+            int windowedX{};
+            int windowedY{};
+            int windowedWidth{};
+            int windowedHeight{};
             std::function<HitTestResult(const Vector2&)> hitTestCallback{};
             DropCallbacks dropCallbacks{};
         };
@@ -624,6 +631,54 @@ namespace rwin {
         if (const auto info = _impl->Find(id)) {
             glfwMaximizeWindow(info->window);
         }
+    }
+
+    void GLFWWindowManager::SetFullscreen(const std::uint64_t& id, const bool fullscreen) {
+        const auto info = _impl->Find(id);
+        if (!info || info->fullscreen == fullscreen) {
+            return;
+        }
+
+        if (fullscreen) {
+            GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+            const GLFWvidmode* mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+            if (!mode) {
+                return;
+            }
+
+            glfwGetWindowPos(info->window, &info->windowedX, &info->windowedY);
+            glfwGetWindowSize(info->window, &info->windowedWidth, &info->windowedHeight);
+            glfwSetWindowMonitor(info->window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+        } else {
+            glfwSetWindowMonitor(info->window, nullptr, info->windowedX, info->windowedY, info->windowedWidth,
+                info->windowedHeight, GLFW_DONT_CARE);
+        }
+
+        info->fullscreen = fullscreen;
+    }
+
+    // `size` is in framebuffer pixels like GetClientSize(); glfwSetWindowSize wants window units.
+    void GLFWWindowManager::SetSize(const std::uint64_t& id, const Extent2D& size) {
+        const auto info = _impl->Find(id);
+        if (!info) {
+            return;
+        }
+
+        int windowW{};
+        int windowH{};
+        int fbW{};
+        int fbH{};
+        glfwGetWindowSize(info->window, &windowW, &windowH);
+        glfwGetFramebufferSize(info->window, &fbW, &fbH);
+
+        auto width = static_cast<double>(size.width);
+        auto height = static_cast<double>(size.height);
+        if (fbW > 0 && fbH > 0) {
+            width *= static_cast<double>(windowW) / fbW;
+            height *= static_cast<double>(windowH) / fbH;
+        }
+
+        glfwSetWindowSize(info->window, static_cast<int>(std::lround(width)), static_cast<int>(std::lround(height)));
     }
 
     float GLFWWindowManager::GetDpi(const std::uint64_t& id) {

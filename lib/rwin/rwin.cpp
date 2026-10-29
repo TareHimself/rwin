@@ -37,6 +37,12 @@ namespace rwin
     void maximizeWindow(const std::uint64_t& id){
         IWindowManager::Get()->Maximize(id);
     }
+    void setWindowFullscreen(const std::uint64_t& id, bool fullscreen){
+        IWindowManager::Get()->SetFullscreen(id,fullscreen);
+    }
+    void setWindowSize(const std::uint64_t& id, const Extent2D& size){
+        IWindowManager::Get()->SetSize(id,size);
+    }
     float getWindowDpi(const std::uint64_t& id){
         return IWindowManager::Get()->GetDpi(id);
     }

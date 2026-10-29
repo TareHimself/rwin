@@ -25,6 +25,8 @@ namespace rwin {
         virtual void Hide(const std::uint64_t& id) = 0;
         virtual void Minimize(const std::uint64_t& id) = 0;
         virtual void Maximize(const std::uint64_t& id) = 0;
+        virtual void SetFullscreen(const std::uint64_t& id, bool fullscreen) = 0;
+        virtual void SetSize(const std::uint64_t& id, const Extent2D& size) = 0;
         virtual float GetDpi(const std::uint64_t& id) = 0;
         virtual float GetDefaultDpi() = 0;
         virtual void PumpEvents() = 0;

@@ -34,6 +34,10 @@ namespace rwin
 
         void Maximize(const std::uint64_t &id) override;
 
+        void SetFullscreen(const std::uint64_t &id, bool fullscreen) override;
+
+        void SetSize(const std::uint64_t &id, const Extent2D &size) override;
+
         float GetDpi(const std::uint64_t &id) override;
 
         float GetDefaultDpi() override;
