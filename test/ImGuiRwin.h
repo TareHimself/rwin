@@ -19,6 +19,7 @@ namespace imguirwin
     struct State
     {
         std::uint64_t windowId{};
+        bool fullscreen{false};
         bool textInputActive{false};
         float appliedScale{0.0f};
         ImGuiStyle baseStyle{};
@@ -471,6 +472,17 @@ namespace imguirwin
         if (ImGui::Button("Maximize"))
         {
             rwin::maximizeWindow(s.windowId);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(s.fullscreen ? "Windowed" : "Fullscreen"))
+        {
+            s.fullscreen = !s.fullscreen;
+            rwin::setWindowFullscreen(s.windowId, s.fullscreen);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("1280 x 720"))
+        {
+            rwin::setWindowSize(s.windowId, rwin::Extent2D{1280, 720});
         }
 
         ImGui::SeparatorText("Scroll");

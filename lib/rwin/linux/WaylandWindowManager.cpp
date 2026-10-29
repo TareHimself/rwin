@@ -1362,6 +1362,51 @@ namespace rwin
         }
     }
 
+    void WaylandWindowManager::SetFullscreen(const std::uint64_t& id, const bool fullscreen)
+    {
+        if (const auto info = GetWindowInfo(id))
+        {
+            if (fullscreen)
+            {
+                libdecor_frame_set_fullscreen(info->frame, nullptr);
+            }
+            else
+            {
+                libdecor_frame_unset_fullscreen(info->frame);
+            }
+        }
+    }
+
+    // `size` is in physical pixels like GetClientSize(); the surface is sized in logical units.
+    void WaylandWindowManager::SetSize(const std::uint64_t& id, const Extent2D& size)
+    {
+        const auto info = GetWindowInfo(id);
+        if (!info)
+        {
+            return;
+        }
+
+        const auto scale = static_cast<std::uint32_t>(info->scale);
+        const Extent2D logical{std::max(size.width / scale, 1u), std::max(size.height / scale, 1u)};
+        if (logical == info->size)
+        {
+            return;
+        }
+
+        info->size = logical;
+        const auto state = libdecor_state_new(static_cast<int>(logical.width), static_cast<int>(logical.height));
+        libdecor_frame_commit(info->frame, state, nullptr);
+        libdecor_state_free(state);
+
+        WindowEvent ev{};
+        new(&ev.resize) ResizeEvent{
+            .type = WindowEventType::Resize,
+            .windowId = info->windowId,
+            .size = GetPhysicalSize(info),
+        };
+        _pendingEvents.push_back(ev);
+    }
+
     float WaylandWindowManager::GetDpi(const std::uint64_t& id)
     {
         if (const auto info = GetWindowInfo(id))

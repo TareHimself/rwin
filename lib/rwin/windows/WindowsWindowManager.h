@@ -22,6 +22,9 @@ namespace rwin
         bool textInputActive{false};
         bool preeditActive{false};
         bool maximized{false};
+        bool fullscreen{false};
+        LONG_PTR windowedStyle{0};
+        RECT windowedRect{};
         std::uint32_t heldButtons{0};
         Rect2D textInputRect{};
         char16_t pendingHighSurrogate{0}; // first half of a pair, waiting for its WM_CHAR partner
@@ -54,6 +57,8 @@ namespace rwin
         void ClearHitTestCallback(const std::uint64_t& id) override;
         void Minimize(const std::uint64_t& id) override;
         void Maximize(const std::uint64_t& id) override;
+        void SetFullscreen(const std::uint64_t& id, bool fullscreen) override;
+        void SetSize(const std::uint64_t& id, const Extent2D& size) override;
         float GetDpi(const std::uint64_t& id) override;
         float GetDefaultDpi() override;
         void SetDropCallbacks(const std::uint64_t& id, const DropCallbacks& callbacks) override;
