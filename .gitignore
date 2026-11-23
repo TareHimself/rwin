@@ -6,4 +6,3 @@ vcpkg_installed
 .DS_Store
 .venv/
 .silo/
-/build-glfw

@@ -12,6 +12,7 @@
 #include <deque>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -45,7 +46,41 @@ namespace {
         DropCallbacks dropCallbacks{};
         DropEffect dragEnterEffect{DropEffect::None}; // enter's answer, reused when `over` is not set
         bool zoomed{false}; // last observed zoom state, so Maximize fires once per transition
+        // AppKit ignores toggleFullScreen: mid-animation, so a request made then waits for it to end.
+        bool fullscreenTransition{false};
+        std::optional<bool> pendingFullscreen{};
+        // Style and frame to put back on exit, for windows lent the bits native fullscreen needs.
+        std::optional<NSWindowStyleMask> windowedStyleMask{};
+        NSRect windowedFrame{};
     };
+
+    bool IsFullscreen(NSWindow* window) {
+        return ([window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+    }
+
+    void ToggleFullscreen(DarwinWindowInfo& info) {
+        NSWindow* window = info.window;
+        if (!IsFullscreen(window)) {
+            // Native fullscreen only fills the screen for titled, resizable windows; lend those until it exits.
+            const NSWindowStyleMask needed = NSWindowStyleMaskTitled | NSWindowStyleMaskResizable;
+            if ((window.styleMask & needed) != needed) {
+                info.windowedStyleMask = window.styleMask;
+                info.windowedFrame = window.frame;
+                window.styleMask |= needed;
+            }
+            // Borderless and fixed-size windows are not fullscreen-capable by default.
+            window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+        }
+        info.fullscreenTransition = true;
+        [window toggleFullScreen:nil];
+    }
+
+    void RestoreWindowedStyle(DarwinWindowInfo& info) {
+        if (!info.windowedStyleMask) return;
+        info.window.styleMask = *info.windowedStyleMask;
+        [info.window setFrame:info.windowedFrame display:YES];
+        info.windowedStyleMask.reset();
+    }
 
     InputKey ToInputKey(unsigned short code) {
         switch (code) {
@@ -281,6 +316,44 @@ namespace {
     self.info->events->push_back(ev);
 }
 
+- (void)windowWillEnterFullScreen:(NSNotification*)notification {
+    if (self.info) self.info->fullscreenTransition = true;
+}
+
+- (void)windowWillExitFullScreen:(NSNotification*)notification {
+    if (self.info) self.info->fullscreenTransition = true;
+}
+
+- (void)windowDidEnterFullScreen:(NSNotification*)notification       { [self finishFullscreenTransition]; }
+- (void)windowDidExitFullScreen:(NSNotification*)notification {
+    if (self.info) RestoreWindowedStyle(*self.info);
+    [self finishFullscreenTransition];
+}
+
+- (void)windowDidFailToEnterFullScreen:(NSWindow*)window {
+    if (self.info) RestoreWindowedStyle(*self.info);
+    [self finishFullscreenTransition];
+}
+
+- (void)windowDidFailToExitFullScreen:(NSWindow*)window              { [self finishFullscreenTransition]; }
+
+- (void)finishFullscreenTransition {
+    auto* info = self.info;
+    if (!info) return;
+    info->fullscreenTransition = false;
+    if (!info->pendingFullscreen) return;
+    const bool want = *info->pendingFullscreen;
+    info->pendingFullscreen.reset();
+    if (want != IsFullscreen(info->window)) {
+        // Toggling from inside the did-enter/exit notification is ignored too, so wait a run loop pass.
+        info->fullscreenTransition = true;
+        __weak RWINWindowDelegate* weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (auto* later = weakSelf.info) ToggleFullscreen(*later);
+        });
+    }
+}
+
 - (void)windowDidChangeBackingProperties:(NSNotification*)notification {
     auto* info = self.info;
     if (!info) return;
@@ -498,6 +571,7 @@ namespace {
 }
 
 - (void)keyUp:(NSEvent*)event {
+    if (!self.info) return; // window destroyed; AppKit can still deliver queued events
     WindowEvent ev{};
     new (&ev.key) rwin::KeyEvent{
         .type     = rwin::WindowEventType::Key,
@@ -510,6 +584,7 @@ namespace {
 }
 
 - (void)flagsChanged:(NSEvent*)event {
+    if (!self.info) return; // window destroyed; AppKit can still deliver queued events
     rwin::InputKey key  = rwin::InputKey::Unknown;
     bool pressed        = false;
     NSEventModifierFlags mods = [event modifierFlags];
@@ -601,6 +676,7 @@ namespace {
 
 // Screen rect of the text caret, which the IME uses to place its candidate popup.
 - (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    if (!self.info) return NSZeroRect;
     const Rect2D& caret = self.info->caretRect;
     const CGFloat scale = self.window.backingScaleFactor;
     const NSRect inView = NSMakeRect(caret.offset.x / scale, caret.offset.y / scale,
@@ -626,6 +702,7 @@ namespace {
 }
 
 - (void)pushCursorButton:(NSEvent*)event button:(rwin::CursorButton)btn state:(rwin::InputState)st {
+    if (!self.info) return; // window destroyed; AppKit can still deliver queued events
     WindowEvent ev{};
     new (&ev.cursorButton) rwin::CursorButtonEvent{
         .type     = rwin::WindowEventType::CursorButton,
@@ -638,6 +715,7 @@ namespace {
 }
 
 - (void)pushCursorMove:(NSEvent*)event {
+    if (!self.info) return; // window destroyed; AppKit can still deliver queued events
     NSPoint p = [self localPos:event];
     WindowEvent ev{};
     new (&ev.cursorMove) rwin::CursorMoveEvent{
@@ -702,6 +780,7 @@ namespace {
 - (void)otherMouseDragged:(NSEvent*)event { [self pushCursorMove:event]; }
 
 - (void)mouseEntered:(NSEvent*)event {
+    if (!self.info) return; // window destroyed; AppKit can still deliver queued events
     WindowEvent ev{};
     new (&ev.cursorFocus) rwin::FocusEvent{
         .type    = rwin::WindowEventType::CursorFocus,
@@ -712,6 +791,7 @@ namespace {
 }
 
 - (void)mouseExited:(NSEvent*)event {
+    if (!self.info) return; // window destroyed; AppKit can still deliver queued events
     WindowEvent ev{};
     new (&ev.cursorFocus) rwin::FocusEvent{
         .type    = rwin::WindowEventType::CursorFocus,
@@ -722,6 +802,7 @@ namespace {
 }
 
 - (void)scrollWheel:(NSEvent*)event {
+    if (!self.info) return; // window destroyed; AppKit can still deliver queued events
     NSPoint p = [self localPos:event];
 
     // AppKit's point deltas cover both trackpads and line-based wheels (it converts lines to points
@@ -1025,13 +1106,12 @@ void DarwinWindowManager::Maximize(const std::uint64_t& id) {
 void DarwinWindowManager::SetFullscreen(const std::uint64_t& id, const bool fullscreen) {
     auto* info = _impl->Find(id);
     if (!info) return;
-    const bool isFullscreen = ([info->window styleMask] & NSWindowStyleMaskFullScreen) != 0;
-    if (isFullscreen == fullscreen) return;
-    if (fullscreen) {
-        // Borderless and fixed-size windows are not fullscreen-capable by default.
-        info->window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
+    if (info->fullscreenTransition) {
+        info->pendingFullscreen = fullscreen;
+        return;
     }
-    [info->window toggleFullScreen:nil];
+    if (IsFullscreen(info->window) == fullscreen) return;
+    ToggleFullscreen(*info);
 }
 
 // `size` is in backing pixels like GetClientSize(); setContentSize: wants points.

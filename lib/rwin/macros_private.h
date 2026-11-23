@@ -1,6 +1,6 @@
 #pragma once
 
-#if !defined(RWIN_MACROS) && !defined(RWIN_PLATFORM_COMPAT)
+#ifndef RWIN_MACROS
 #define RWIN_MACROS
     #ifdef _WIN32
     #define RWIN_PLATFORM_WIN
