@@ -5,7 +5,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
 
 set(RWIN_VERSION "1.0.0" CACHE STRING "rwin version")
-set(RWIN_PLATFORM_COMPAT OFF CACHE BOOL "use glfw instead of platform custom platform manager")
 project(rwin LANGUAGES C CXX VERSION ${RWIN_VERSION} DESCRIPTION "C++ library for management of windows")
 if(APPLE)
     enable_language(OBJCXX)
@@ -18,8 +17,6 @@ if(APPLE)
 endif()
 
 add_library(${PROJECT_NAME} ${SOURCE_FILES}
-        lib/rwin/glfw/GLFWWindowManager.cpp
-        lib/rwin/glfw/GLFWWindowManager.h
         include/rwin/macros.h)
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -37,90 +34,79 @@ endif()
 find_package(Vulkan REQUIRED)
 target_link_libraries(${PROJECT_NAME} PUBLIC Vulkan::Vulkan)
 include(GNUInstallDirs)
-if(RWIN_PLATFORM_COMPAT)
-    find_package(glfw3 REQUIRED)
-    if(TARGET glfw3::glfw)
-        target_link_libraries(${PROJECT_NAME} PRIVATE glfw3::glfw)
-    else()
-        target_link_libraries(${PROJECT_NAME} PRIVATE glfw)
-    endif()
-    target_compile_definitions(${PROJECT_NAME} PRIVATE RWIN_PLATFORM_COMPAT)
-else()
-    if(LINUX)
-        find_package(wayland COMPONENTS wayland-client REQUIRED)
-        find_package(wayland-protocols REQUIRED)
-        find_package(xkbcommon REQUIRED)
-        find_package(libdecor REQUIRED)
-        include(FindPkgConfig)
-        pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
-        find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner)
+if(LINUX)
+    find_package(wayland COMPONENTS wayland-client REQUIRED)
+    find_package(wayland-protocols REQUIRED)
+    find_package(xkbcommon REQUIRED)
+    find_package(libdecor REQUIRED)
+    include(FindPkgConfig)
+    pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+    find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner)
 
-        set(PROTOCOLS
-                stable/xdg-shell/xdg-shell.xml
-                unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
-                #    unstable/relative-pointer/relative-pointer-unstable-v1.xml
-                #    unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
-                #    stable/viewporter/viewporter.xml
-        )
+    set(PROTOCOLS
+            stable/xdg-shell/xdg-shell.xml
+            unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+            #    unstable/relative-pointer/relative-pointer-unstable-v1.xml
+            #    unstable/pointer-constraints/pointer-constraints-unstable-v1.xml
+            #    stable/viewporter/viewporter.xml
+    )
 
-        set(WAYLAND_GENERATED_HEADERS "")
-        set(WAYLAND_GENERATED_SOURCES "")
-        set(WAYLAND_GENERATED_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/external/wayland")
-        file(MAKE_DIRECTORY ${WAYLAND_GENERATED_OUTPUT_DIR})
-        foreach(xml IN LISTS PROTOCOLS)
-            get_filename_component(name "${xml}" NAME_WE)
-            string(REPLACE "-" "_" cname ${name})  # safer variable names
-            set(header "${WAYLAND_GENERATED_OUTPUT_DIR}/${name}-client-protocol.h")
-            set(source "${WAYLAND_GENERATED_OUTPUT_DIR}/${name}-protocol.c")
+    set(WAYLAND_GENERATED_HEADERS "")
+    set(WAYLAND_GENERATED_SOURCES "")
+    set(WAYLAND_GENERATED_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/external/wayland")
+    file(MAKE_DIRECTORY ${WAYLAND_GENERATED_OUTPUT_DIR})
+    foreach(xml IN LISTS PROTOCOLS)
+        get_filename_component(name "${xml}" NAME_WE)
+        string(REPLACE "-" "_" cname ${name})  # safer variable names
+        set(header "${WAYLAND_GENERATED_OUTPUT_DIR}/${name}-client-protocol.h")
+        set(source "${WAYLAND_GENERATED_OUTPUT_DIR}/${name}-protocol.c")
 
-            list(APPEND WAYLAND_GENERATED_HEADERS ${header})
-            list(APPEND WAYLAND_GENERATED_SOURCES ${source})
+        list(APPEND WAYLAND_GENERATED_HEADERS ${header})
+        list(APPEND WAYLAND_GENERATED_SOURCES ${source})
 
+        if(NOT EXISTS "${header}")
+            message(STATUS "Generating ${name}")
+            execute_process(COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${WAYLAND_PROTOCOLS_DIR}/${xml} ${header})
             if(NOT EXISTS "${header}")
-                message(STATUS "Generating ${name}")
-                execute_process(COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${WAYLAND_PROTOCOLS_DIR}/${xml} ${header})
-                if(NOT EXISTS "${header}")
-                    message(FATAL_ERROR "Failed to generate ${name}")
-                endif()
+                message(FATAL_ERROR "Failed to generate ${name}")
             endif()
+        endif()
 
+        if(NOT EXISTS "${source}")
+            message(STATUS "Generating ${name}")
+            execute_process(COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${WAYLAND_PROTOCOLS_DIR}/${xml} ${source})
             if(NOT EXISTS "${source}")
-                message(STATUS "Generating ${name}")
-                execute_process(COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code  ${WAYLAND_PROTOCOLS_DIR}/${xml} ${source})
-                if(NOT EXISTS "${source}")
-                    message(FATAL_ERROR "Failed to generate ${name}")
-                endif()
+                message(FATAL_ERROR "Failed to generate ${name}")
             endif()
+        endif()
 
-            message(STATUS "Generated wayland protocol: ${name}")
-        endforeach()
+        message(STATUS "Generated wayland protocol: ${name}")
+    endforeach()
 
-        target_sources(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_SOURCES})
-        target_include_directories(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_OUTPUT_DIR})
-        target_link_libraries(${PROJECT_NAME} PRIVATE wayland::wayland-client wayland::wayland-cursor wayland-protocols::wayland-protocols libdecor::libdecor xkbcommon::xkbcommon)
-        set(LIBDECOR_PLUGINS_DIR ${libdecor_ROOT_DIR}/lib/libdecor/plugins-1)
-        set_property(TARGET rwin PROPERTY RESOURCE_DIRS
-                $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/share/libdecor/plugins-1>$<BUILD_INTERFACE:${LIBDECOR_PLUGINS_DIR}>
-        )
-        install(
-                DIRECTORY ${LIBDECOR_PLUGINS_DIR}/
-                DESTINATION share/libdecor/plugins-1
-        )
+    target_sources(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_SOURCES})
+    target_include_directories(${PROJECT_NAME} PRIVATE ${WAYLAND_GENERATED_OUTPUT_DIR})
+    target_link_libraries(${PROJECT_NAME} PRIVATE wayland::wayland-client wayland::wayland-cursor wayland-protocols::wayland-protocols libdecor::libdecor xkbcommon::xkbcommon)
+    set(LIBDECOR_PLUGINS_DIR ${libdecor_ROOT_DIR}/lib/libdecor/plugins-1)
+    set_property(TARGET rwin PROPERTY RESOURCE_DIRS
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_PREFIX}/share/libdecor/plugins-1>$<BUILD_INTERFACE:${LIBDECOR_PLUGINS_DIR}>
+    )
+    install(
+            DIRECTORY ${LIBDECOR_PLUGINS_DIR}/
+            DESTINATION share/libdecor/plugins-1
+    )
 
-    endif()
+endif()
 
-    if(APPLE)
-        target_link_libraries(${PROJECT_NAME} PRIVATE
-            "-framework AppKit"
-            "-framework Metal"
-            "-framework QuartzCore"
-        )
-        set_source_files_properties(
-            lib/rwin/darwin/DarwinWindowManager.mm
-            PROPERTIES COMPILE_FLAGS "-fobjc-arc"
-        )
-    endif()
-
+if(APPLE)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        "-framework AppKit"
+        "-framework Metal"
+        "-framework QuartzCore"
+    )
+    set_source_files_properties(
+        lib/rwin/darwin/DarwinWindowManager.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+    )
 endif()
 
 # Install headers

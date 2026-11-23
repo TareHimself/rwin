@@ -36,7 +36,7 @@ target_include_directories(imgui_vulkan PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURC
 target_link_libraries(imgui_vulkan PUBLIC Vulkan::Vulkan)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE rwin::rwin Vulkan::Vulkan imgui_vulkan)
-if(LINUX AND NOT RWIN_PLATFORM_COMPAT)
+if(LINUX)
     get_target_property(RWIN_RES_DIRS rwin RESOURCE_DIRS)
     message(STATUS ${RWIN_RES_DIRS})
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD

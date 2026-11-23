@@ -1,15 +1,7 @@
 #include "macros_private.h"
 #include "rwin/IWindowManager.h"
 
-#if defined(RWIN_PLATFORM_COMPAT)
-#include "glfw/GLFWWindowManager.h"
-namespace rwin {
-    IWindowManager *IWindowManager::Get() {
-        static auto instance = std::make_unique<GLFWWindowManager>();
-        return instance.get();
-    }
-}
-#elif defined(RWIN_PLATFORM_WIN)
+#if defined(RWIN_PLATFORM_WIN)
 #include "windows/WindowsWindowManager.h"
 namespace rwin {
     IWindowManager *IWindowManager::Get() {
